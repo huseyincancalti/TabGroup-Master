@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "TabGroup Master",
+  "version": "1.0.0",
+  "description": "Manage, categorize, and sort your Chrome tab groups with a powerful side panel.",
+  "permissions": [
+    "tabGroups",
+    "tabs",
+    "sidePanel",
+    "storage",
+    "nativeMessaging"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "action": {
+    "default_title": "TabGroup Master"
+  },
+  "options_page": "dashboard.html"
+}

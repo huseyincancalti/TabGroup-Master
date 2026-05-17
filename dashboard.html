@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TabGroup Master — Dashboard</title>
+  <link rel="stylesheet" href="dashboard.css" />
+</head>
+<body>
+
+  <div class="dashboard-shell">
+    <aside class="dashboard-sidebar">
+      <div class="sidebar-brand">
+        <svg class="brand-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="7" height="7" rx="1.5"/>
+          <rect x="14" y="3" width="7" height="7" rx="1.5"/>
+          <rect x="3" y="14" width="7" height="7" rx="1.5"/>
+          <rect x="14" y="14" width="7" height="7" rx="1.5"/>
+        </svg>
+        <div>
+          <h1>TabGroup Master</h1>
+          <p>Full Dashboard</p>
+        </div>
+      </div>
+
+      <nav class="sidebar-nav">
+        <button class="nav-btn active" data-view="overview">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+          Overview
+        </button>
+        <button class="nav-btn" data-view="settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+          Settings
+        </button>
+      </nav>
+    </aside>
+
+    <main class="dashboard-main">
+      <!-- Overview -->
+      <section id="view-overview" class="dashboard-view active">
+        <header class="view-header">
+          <div>
+            <h2>Overview</h2>
+            <p>Drag groups into categories to organize your workspace.</p>
+          </div>
+          <button id="btn-new-category" class="btn-primary" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            New Category
+          </button>
+        </header>
+
+
+        <div id="welcome-banner" class="welcome-banner glass-panel">
+          <div class="welcome-banner-inner">
+            <div class="welcome-banner-text">
+              <h3>Welcome to TabGroup Master</h3>
+              <ol>
+                <li>Use <strong>Auto-Scan</strong> to import hidden groups.</li>
+                <li><strong>Drag &amp; Drop</strong> groups into categories.</li>
+                <li><strong>Export</strong> your data anytime from Settings.</li>
+              </ol>
+              <div class="macro-setup-section">
+                <h4>Macro Setup Guide</h4>
+                <p class="macro-setup-desc">Set up Auto-Scan native messaging in three simple steps:</p>
+                <ol class="setup-steps">
+                  <li>Download the <code>NativeHost</code> folder to your PC.</li>
+                  <li>Double-click the <code>install.bat</code> file.</li>
+                  <li>It will automatically configure paths and connect to Chrome. You're done!</li>
+                </ol>
+              </div>
+            </div>
+            <button id="welcome-banner-dismiss" class="welcome-dismiss" type="button" aria-label="Dismiss welcome banner">&times;</button>
+          </div>
+        </div>
+
+        <div class="overview-layout">
+          <aside class="groups-panel glass-panel">
+            <div class="panel-head">
+              <h3>All Groups</h3>
+              <span id="groups-count" class="panel-badge">0</span>
+            </div>
+            <div id="all-groups-list" class="groups-list"></div>
+            <p id="groups-empty" class="panel-empty hidden">No groups yet. Open Chrome tab groups to get started.</p>
+          </aside>
+
+          <section class="categories-panel">
+            <div class="panel-head">
+              <h3>Categories</h3>
+              <span id="categories-count" class="panel-badge">0</span>
+            </div>
+            <div id="categories-grid" class="categories-grid"></div>
+            <p id="categories-empty" class="panel-empty hidden">No categories yet. Create one and drag groups here.</p>
+          </section>
+        </div>
+      </section>
+
+      <!-- Settings -->
+      <section id="view-settings" class="dashboard-view">
+        <header class="view-header">
+          <div>
+            <h2>Settings</h2>
+            <p>Configure native messaging and preferences.</p>
+          </div>
+        </header>
+
+        <div class="settings-content">
+          <article class="settings-card glass-panel">
+            <h3>Data Management</h3>
+            <p class="settings-desc">Export your tab groups and category layout as a portable JSON backup.</p>
+            <button id="btn-export-json" class="btn-primary btn-export" type="button">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              Export to JSON
+            </button>
+          </article>
+
+          <article class="settings-card glass-panel">
+            <h3>Language (i18n)</h3>
+            <p class="settings-desc">Multi-language support coming soon. JSON translation files will plug in here.</p>
+            <div class="lang-field">
+              <label for="lang-select">Interface Language</label>
+              <select id="lang-select" disabled>
+                <option value="en" selected>English (Default)</option>
+              </select>
+              <span class="lang-lock">🔒 Locked — translations in development</span>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- New Category Modal -->
+  <div id="dash-modal-overlay" class="hidden">
+    <div class="dash-modal glass-panel">
+      <h3>Create Category</h3>
+      <input type="text" id="dash-category-name" placeholder="Category name…" autocomplete="off" spellcheck="false" />
+      <div class="dash-modal-actions">
+        <button id="dash-modal-cancel" class="btn-secondary" type="button">Cancel</button>
+        <button id="dash-modal-confirm" class="btn-primary" type="button">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-container"></div>
+
+  <script src="dashboard.js"></script>
+</body>
+</html>
