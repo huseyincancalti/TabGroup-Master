@@ -54,6 +54,8 @@ body {
   line-height: 1.5;
   overflow-x: hidden;
   min-height: 100vh;
+  display: flex;
+  flex-direction: column;
 }
 
 /* ─── Scrollbar ─── */
@@ -195,7 +197,8 @@ body {
   z-index: 50;
 }
 
-#toolbar .btn-macro {
+#toolbar .btn-macro,
+#toolbar > .btn-macro {
   flex: 1;
   min-width: 0;
   width: auto;
@@ -472,6 +475,33 @@ body {
 /* ─── Main Content ─── */
 #content {
   padding: 8px 12px 20px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.pane-hint {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  padding: 6px 4px 10px;
+  line-height: 1.5;
+  border-bottom: 1px dashed var(--border);
+  margin-bottom: 8px;
+}
+
+.folder-tag {
+  font-size: 10px;
+  opacity: 0.85;
+  margin-left: 4px;
+}
+
+.glass-modal {
+  background: var(--bg-secondary);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
 }
 
 /* ─── Section Headers ─── */
@@ -1170,4 +1200,13 @@ body {
   outline: none;
   width: 100%;
   max-width: 180px;
+}
+
+/* ─── Search Highlight Styles ─── */
+.search-highlight {
+  background-color: rgba(253, 214, 99, 0.35);
+  color: #fdd663;
+  border-radius: 2px;
+  padding: 0 2px;
+  font-weight: bold;
 }

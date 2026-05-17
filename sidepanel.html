@@ -17,7 +17,6 @@
     <span class="dashboard-rocket">🚀</span>
   </button>
 
-  <!-- Header -->
   <header id="header">
     <div class="header-brand">
       <svg class="header-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -37,7 +36,6 @@
     </div>
   </header>
 
-  <!-- â”€â”€ Toolbar â”€â”€ -->
   <div id="toolbar">
     <button id="btn-run-macro" class="btn-macro" type="button">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -58,22 +56,21 @@
     </label>
   </div>
 
-  <!-- Tab Bar -->
   <div id="tab-bar">
-    <button class="tab-btn active" data-tab="active">
+    <button class="tab-btn active" data-tab="active" type="button">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
       </svg>
       Active
     </button>
-    <button class="tab-btn" data-tab="saved">
+    <button class="tab-btn" data-tab="saved" type="button">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/>
         <polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>
       </svg>
-      Saved
+      Inbox
     </button>
-    <button class="tab-btn" data-tab="conflicts">
+    <button class="tab-btn" data-tab="conflicts" type="button">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
         <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
@@ -83,43 +80,30 @@
     </button>
   </div>
 
-  <!-- â”€â”€ Content â”€â”€ -->
   <main id="content">
-
-    <!-- Active Tab -->
     <section id="pane-active" class="pane">
-      <div id="categories-list"></div>
-      <section id="uncategorized-section">
-        <div class="section-header">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v16"/>
-          </svg>
-          <h2>Ungrouped</h2>
-        </div>
-        <div id="uncategorized-groups" class="groups-container"></div>
-      </section>
+      <div id="active-groups-list" class="groups-container"></div>
       <div id="empty-active" class="empty-state hidden">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="12" cy="12" r="10"/><path d="M8 15h8M9 9h.01M15 9h.01"/>
         </svg>
         <p>No active tab groups.</p>
-        <span>Right-click a tab â†’ "Add to group" to get started.</span>
+        <span>Right-click a tab → "Add to group" to get started.</span>
       </div>
     </section>
 
-    <!-- Saved Tab -->
     <section id="pane-saved" class="pane hidden">
+      <p class="pane-hint">Unorganized saved groups. Drag into folders from the Dashboard Workspace.</p>
       <div id="saved-groups-list" class="groups-container"></div>
       <div id="empty-saved" class="empty-state hidden">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/>
         </svg>
-        <p>No saved groups yet.</p>
-        <span>Closed Chrome groups are automatically saved here.</span>
+        <p>Inbox is empty.</p>
+        <span>Closed groups not in a folder appear here.</span>
       </div>
     </section>
 
-    <!-- Conflicts Tab -->
     <section id="pane-conflicts" class="pane hidden">
       <div id="conflicts-list"></div>
       <div id="empty-conflicts" class="empty-state hidden">
@@ -131,27 +115,24 @@
         <span>Enable Import Mode to detect title collisions.</span>
       </div>
     </section>
-
   </main>
 
-  <!-- Edit Group Modal -->
   <div id="edit-modal-overlay" class="hidden">
-    <div id="edit-modal">
+    <div id="edit-modal" class="glass-modal">
       <h3>Edit Group</h3>
       <label for="edit-group-title">Name</label>
       <input type="text" id="edit-group-title" autocomplete="off" spellcheck="false"/>
       <label>Color</label>
       <div id="edit-color-picker"></div>
       <div id="edit-modal-actions">
-        <button id="edit-modal-cancel" class="btn-secondary">Cancel</button>
-        <button id="edit-modal-confirm" class="btn-primary">Save</button>
+        <button id="edit-modal-cancel" class="btn-secondary" type="button">Cancel</button>
+        <button id="edit-modal-confirm" class="btn-primary" type="button">Save</button>
       </div>
     </div>
   </div>
 
-  <!-- ── Macro Guide Modal ── -->
   <div id="macro-guide-modal" class="hidden">
-    <div class="macro-guide-dialog">
+    <div class="macro-guide-dialog glass-modal">
       <h3>Auto-Scan Guide</h3>
       <img src="macro-guide.gif" id="macro-guide-gif" alt="Macro Guide" style="width:100%; border-radius:8px; margin-bottom:15px;">
       <p class="macro-guide-instruction">Move your mouse exactly where the GIF shows (The Tab Groups Grid Icon).</p>
@@ -169,5 +150,3 @@
   <script src="sidepanel.js"></script>
 </body>
 </html>
-
-

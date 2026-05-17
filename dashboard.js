@@ -7,13 +7,12 @@ const COLOR_HEX = {
 
 let state = {
   savedGroups: [],
-  categories: [],
+  folders: [],
   activeView: "overview",
 };
 
-let dragSrcGroupUid = null;
-
-// ─── Init ─────────────────────────────────────────────────────────────────────
+let modalContext = null;
+const sortableInstances = [];
 
 document.addEventListener("DOMContentLoaded", async () => {
   await loadData();
@@ -23,7 +22,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
 chrome.storage.onChanged.addListener(async (changes, area) => {
   if (area !== "local") return;
-  if (changes.savedGroups || changes.categories || changes.conflicts || changes.importMode) {
+  if (changes.savedGroups || changes.folders || changes.conflicts || changes.importMode) {
     await loadData();
     render();
   }
@@ -35,12 +34,13 @@ chrome.runtime.onMessage.addListener(async (message) => {
   render();
 });
 
-// ─── Messaging ────────────────────────────────────────────────────────────────
-
 function sendMsg(message) {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage(message, (response) => {
-      if (chrome.runtime.lastError) { resolve(null); return; }
+      if (chrome.runtime.lastError) {
+        resolve(null);
+        return;
+      }
       resolve(response);
     });
   });
@@ -49,19 +49,16 @@ function sendMsg(message) {
 async function loadData() {
   const store = await sendMsg({ action: "getStore" });
   if (!store) return;
-  state.savedGroups = store.savedGroups || [];
-  state.categories = store.categories || [];
-  const liveUids = new Set(state.savedGroups.map((g) => g.uid));
-  state.categories.forEach((cat) => {
-    cat.groupUids = (cat.groupUids || []).filter((u) => liveUids.has(u));
-  });
+  state.savedGroups = (store.savedGroups || []).map((g) => ({
+    ...g,
+    folderId: g.folderId ?? null,
+  }));
+  state.folders = (store.folders || []).map((f) => ({
+    ...f,
+    parentId: f.parentId ?? null,
+    isExpanded: f.isExpanded !== false,
+  }));
 }
-
-async function persistCategories() {
-  await sendMsg({ action: "saveCategories", categories: state.categories });
-}
-
-// ─── Navigation ───────────────────────────────────────────────────────────────
 
 function switchView(view) {
   state.activeView = view;
@@ -71,335 +68,455 @@ function switchView(view) {
   document.querySelectorAll(".dashboard-view").forEach((el) => {
     el.classList.toggle("active", el.id === `view-${view}`);
   });
+  if (view === "workspace") {
+    renderTree();
+  }
 }
-
-// ─── Render ───────────────────────────────────────────────────────────────────
 
 function render() {
-  renderWelcomeBanner();
-  renderAllGroups();
-  renderCategoriesGrid();
+  if (state.activeView === "workspace" || document.getElementById("view-workspace")?.classList.contains("active")) {
+    renderTree();
+  }
 }
 
-const WELCOME_DISMISS_KEY = "welcomeBannerDismissed";
-
-function renderWelcomeBanner() {
-  const banner = document.getElementById("welcome-banner");
-  if (!banner) return;
-  chrome.storage.local.get([WELCOME_DISMISS_KEY], (data) => {
-    banner.classList.toggle("hidden", !!data[WELCOME_DISMISS_KEY]);
-  });
+function isRootParent(parentId) {
+  return parentId == null || parentId === "";
 }
 
-function dismissWelcomeBanner() {
-  const banner = document.getElementById("welcome-banner");
-  if (banner) banner.classList.add("hidden");
-  chrome.storage.local.set({ [WELCOME_DISMISS_KEY]: true });
+function getChildFolders(parentId) {
+  return state.folders
+    .filter((f) => (f.parentId ?? null) === (parentId ?? null))
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function getCategorizedUids() {
-  return new Set(state.categories.flatMap((c) => c.groupUids || []));
+function getChildGroups(folderId) {
+  return state.savedGroups
+    .filter((g) => g.folderId === folderId)
+    .sort((a, b) => {
+      if (a.active !== b.active) return a.active ? -1 : 1;
+      return (a.title || "").localeCompare(b.title || "");
+    });
 }
 
-function renderAllGroups() {
-  const list = document.getElementById("all-groups-list");
-  const empty = document.getElementById("groups-empty");
-  const countEl = document.getElementById("groups-count");
-  const categorized = getCategorizedUids();
+function getInboxGroups() {
+  return state.savedGroups
+    .filter((g) => !g.active && (g.folderId == null || g.folderId === undefined))
+    .sort((a, b) => (a.title || "").localeCompare(b.title || ""));
+}
 
-  const groups = [...state.savedGroups].sort((a, b) => {
-    if (a.active !== b.active) return a.active ? -1 : 1;
-    return (a.title || "").localeCompare(b.title || "");
-  });
+function resolveTargetFolderId(folderIdAttr) {
+  if (!folderIdAttr || folderIdAttr === "root" || folderIdAttr === "inbox") {
+    return null;
+  }
+  return folderIdAttr;
+}
 
-  countEl.textContent = groups.length;
+function renderInbox() {
+  const list = document.getElementById("dashboard-inbox-list");
+  const empty = document.getElementById("inbox-empty");
+  const countEl = document.getElementById("inbox-count");
+  if (!list) return;
+
   list.innerHTML = "";
+  const groups = getInboxGroups();
+  groups.forEach((group) => list.appendChild(buildGroupNode(group, { inInbox: true })));
 
-  if (groups.length === 0) {
-    empty.classList.remove("hidden");
-    return;
+  if (countEl) countEl.textContent = String(groups.length);
+  if (empty) {
+    empty.classList.toggle("hidden", groups.length > 0);
   }
-  empty.classList.add("hidden");
-
-  groups.forEach((group, index) => {
-    const inCat = categorized.has(group.uid);
-    const card = document.createElement("div");
-    card.className = "dash-group-card" + (inCat ? " in-category" : "");
-    card.draggable = true;
-    card.dataset.groupUid = group.uid;
-    card.style.animationDelay = `${index * 35}ms`;
-
-    const dot = COLOR_HEX[group.color] || COLOR_HEX.grey;
-    const title = escHtml(group.title || "Unnamed Group");
-    const tabs = (group.tabs || []).length;
-    const status = group.active ? "active" : "saved";
-    const statusLabel = group.active ? "Active" : "Saved";
-
-    card.innerHTML = `
-      <span class="group-dot" style="background:${dot}"></span>
-      <div class="group-meta">
-        <div class="group-name">${title}</div>
-        <div class="group-sub">${tabs} tab${tabs !== 1 ? "s" : ""}</div>
-      </div>
-      <span class="status-pill ${status}">${statusLabel}</span>`;
-
-    card.addEventListener("dragstart", (e) => {
-      dragSrcGroupUid = group.uid;
-      e.dataTransfer.effectAllowed = "move";
-      card.classList.add("dragging");
-    });
-
-    card.addEventListener("dragend", () => {
-      card.classList.remove("dragging");
-      dragSrcGroupUid = null;
-      document.querySelectorAll(".drop-over").forEach((el) => el.classList.remove("drop-over"));
-    });
-
-    list.appendChild(card);
-  });
 }
 
-function renderCategoriesGrid() {
-  const grid = document.getElementById("categories-grid");
-  const empty = document.getElementById("categories-empty");
-  const countEl = document.getElementById("categories-count");
+function renderFoldersTree() {
+  const root = document.getElementById("folders-tree-container");
+  const empty = document.getElementById("tree-empty");
+  const countEl = document.getElementById("tree-count");
+  if (!root) return;
 
-  countEl.textContent = state.categories.length;
-  grid.innerHTML = "";
+  root.innerHTML = "";
 
-  if (state.categories.length === 0) {
-    empty.classList.remove("hidden");
-    return;
-  }
-  empty.classList.add("hidden");
-
-  state.categories.forEach((cat, index) => {
-    const card = document.createElement("div");
-    card.className = "category-card-dash";
-    card.dataset.catId = cat.id;
-    card.style.animationDelay = `${index * 60}ms`;
-
-    const catGroups = (cat.groupUids || [])
-      .map((uid) => state.savedGroups.find((g) => g.uid === uid))
-      .filter(Boolean);
-
-    const groupsHtml = catGroups.length
-      ? catGroups.map(buildMiniGroupHTML).join("")
-      : `<div class="cat-drop-hint">Drop groups here</div>`;
-
-    card.innerHTML = `
-      <div class="cat-card-header">
-        <span class="cat-card-title" title="${escHtml(cat.name)}">${escHtml(cat.name)}</span>
-        <span class="cat-card-count">${catGroups.length}</span>
-        <div class="cat-card-actions">
-          <button class="btn-rename-cat" title="Rename" type="button">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-          </button>
-          <button class="btn-delete-cat" title="Delete" type="button">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>
-          </button>
-        </div>
-      </div>
-      <div class="cat-card-body">${groupsHtml}</div>`;
-
-    const body = card.querySelector(".cat-card-body");
-    bindCategoryDropZone(card, body, cat.id);
-
-    card.querySelector(".btn-rename-cat").addEventListener("click", () => startRenameCategory(cat, card));
-    card.querySelector(".btn-delete-cat").addEventListener("click", () => deleteCategory(cat.id));
-
-    grid.appendChild(card);
+  const rootFolders = getChildFolders(null);
+  rootFolders.forEach((folder) => {
+    root.appendChild(buildFolderNode(folder));
   });
+
+  const organizedCount = state.savedGroups.filter((g) => g.folderId).length;
+  const total = state.folders.length + organizedCount;
+  if (countEl) countEl.textContent = String(total);
+
+  if (empty) {
+    empty.classList.toggle("hidden", rootFolders.length > 0);
+  }
 }
 
-function buildMiniGroupHTML(group) {
+function renderTree() {
+  if (!document.getElementById("folders-tree-container") && !document.getElementById("dashboard-inbox-list")) {
+    return;
+  }
+
+  destroySortables();
+  renderInbox();
+  renderFoldersTree();
+  initSortableEverywhere();
+}
+
+function buildFolderNode(folder) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "tree-folder";
+  wrapper.dataset.itemType = "folder";
+  wrapper.dataset.folderId = folder.id;
+
+  const expanded = folder.isExpanded !== false;
+  const childFolders = getChildFolders(folder.id);
+  const childGroups = getChildGroups(folder.id);
+  const totalChildren = childFolders.length + childGroups.length;
+
+  wrapper.innerHTML = `
+    <div class="tree-folder-header">
+      <button class="tree-chevron ${expanded ? "open" : ""}" type="button" title="Expand/Collapse" aria-label="Toggle folder">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="9 18 15 12 9 6"/>
+        </svg>
+      </button>
+      <svg class="tree-folder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+      </svg>
+      <span class="tree-folder-name" title="${escHtml(folder.name)}">${escHtml(folder.name)}</span>
+      <span class="tree-folder-count">${totalChildren}</span>
+      <div class="tree-folder-actions">
+        <button class="action-add-subfolder" type="button" title="Add sub-folder">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+            <line x1="12" y1="11" x2="12" y2="17"/>
+            <line x1="9" y1="14" x2="15" y2="14"/>
+          </svg>
+        </button>
+        <button class="action-rename" type="button" title="Rename">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+          </svg>
+        </button>
+        <button class="action-delete" type="button" title="Delete folder">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+            <path d="M10 11v6M14 11v6"/>
+            <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+    <div class="tree-folder-body tree-list ${expanded ? "" : "collapsed"}" data-folder-id="${escHtml(folder.id)}"></div>
+  `;
+
+  const body = wrapper.querySelector(".tree-folder-body");
+  childFolders.forEach((child) => body.appendChild(buildFolderNode(child)));
+  childGroups.forEach((group) => body.appendChild(buildGroupNode(group)));
+
+  const chevron = wrapper.querySelector(".tree-chevron");
+  chevron.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const willCollapse = !body.classList.contains("collapsed");
+    body.classList.toggle("collapsed", willCollapse);
+    chevron.classList.toggle("open", !willCollapse);
+    folder.isExpanded = !willCollapse;
+    await sendMsg({
+      action: "setFolderExpanded",
+      folderId: folder.id,
+      isExpanded: !willCollapse,
+    });
+  });
+
+  wrapper.querySelector(".action-add-subfolder").addEventListener("click", (e) => {
+    e.stopPropagation();
+    openFolderModal({ parentId: folder.id });
+  });
+
+  wrapper.querySelector(".action-rename").addEventListener("click", (e) => {
+    e.stopPropagation();
+    startInlineRename(folder, wrapper);
+  });
+
+  wrapper.querySelector(".action-delete").addEventListener("click", async (e) => {
+    e.stopPropagation();
+    if (!confirm(`Delete folder "${folder.name}"? Groups return to Inbox; sub-folders move to root.`)) return;
+    const res = await sendMsg({ action: "deleteFolder", folderId: folder.id });
+    if (res?.ok) {
+      showToast("Folder deleted", "success");
+      await loadData();
+      renderTree();
+    }
+  });
+
+  return wrapper;
+}
+
+function buildGroupNode(group, options = {}) {
+  const inInbox = options.inInbox === true;
+  const node = document.createElement("div");
+  node.className = "tree-group";
+  node.dataset.itemType = "group";
+  node.dataset.groupUid = group.uid;
+
   const dot = COLOR_HEX[group.color] || COLOR_HEX.grey;
-  const title = escHtml(group.title || "Unnamed Group");
   const tabs = (group.tabs || []).length;
-  return `
-    <div class="dash-group-card" draggable="true" data-group-uid="${group.uid}">
-      <span class="group-dot" style="background:${dot}"></span>
-      <div class="group-meta">
-        <div class="group-name">${title}</div>
-        <div class="group-sub">${tabs} tab${tabs !== 1 ? "s" : ""}</div>
-      </div>
-    </div>`;
-}
+  const title = escHtml(group.title || "Unnamed Group");
+  const statusClass = group.active ? "active" : "saved";
+  const statusLabel = group.active ? "Active" : "Saved";
+  const removeBtn = inInbox
+    ? ""
+    : `<button class="action-remove" type="button" title="Remove from folder (send to Inbox)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="3 6 5 6 21 6"/>
+          <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+          <path d="M10 11v6M14 11v6"/>
+          <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+        </svg>
+      </button>`;
 
-// ─── Drag & Drop ──────────────────────────────────────────────────────────────
+  node.innerHTML = `
+    <svg class="tree-group-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="3" y="3" width="18" height="18" rx="2"/>
+      <line x1="9" y1="3" x2="9" y2="21"/>
+    </svg>
+    <span class="tree-group-dot" style="background:${dot}"></span>
+    <span class="tree-group-title" title="${title}">${title}</span>
+    <span class="tree-group-meta">${tabs} tab${tabs !== 1 ? "s" : ""}</span>
+    <span class="tree-group-status ${statusClass}">${statusLabel}</span>
+    <div class="tree-group-actions">
+      <button class="action-view" type="button" title="${group.active ? "Focus group" : "Restore group"}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+          <circle cx="12" cy="12" r="3"/>
+        </svg>
+      </button>
+      ${removeBtn}
+    </div>
+  `;
 
-function bindCategoryDropZone(cardEl, bodyEl, categoryId) {
-  const onDragOver = (e) => {
-    if (dragSrcGroupUid === null) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
-    cardEl.classList.add("drop-over");
-    bodyEl.classList.add("drop-over");
-  };
-
-  const onDragLeave = (e) => {
-    if (!cardEl.contains(e.relatedTarget)) {
-      cardEl.classList.remove("drop-over");
-      bodyEl.classList.remove("drop-over");
-    }
-  };
-
-  const onDrop = async (e) => {
-    e.preventDefault();
-    cardEl.classList.remove("drop-over");
-    bodyEl.classList.remove("drop-over");
-    if (dragSrcGroupUid === null) return;
-
-    const cat = state.categories.find((c) => c.id === categoryId);
-    if (!cat) return;
-
-    state.categories.forEach((c) => {
-      c.groupUids = (c.groupUids || []).filter((u) => u !== dragSrcGroupUid);
-    });
-
-    cat.groupUids = cat.groupUids || [];
-    if (!cat.groupUids.includes(dragSrcGroupUid)) {
-      cat.groupUids.push(dragSrcGroupUid);
-    }
-
-    await persistCategories();
-    showToast("Group added to category", "success");
-    dragSrcGroupUid = null;
-    render();
-  };
-
-  cardEl.addEventListener("dragover", onDragOver);
-  bodyEl.addEventListener("dragover", onDragOver);
-  cardEl.addEventListener("dragleave", onDragLeave);
-  bodyEl.addEventListener("drop", onDrop);
-  cardEl.addEventListener("drop", onDrop);
-
-  bodyEl.querySelectorAll(".dash-group-card").forEach((miniCard) => {
-    const uid = miniCard.dataset.groupUid;
-    miniCard.addEventListener("dragstart", (e) => {
-      dragSrcGroupUid = uid;
-      e.dataTransfer.effectAllowed = "move";
-      miniCard.classList.add("dragging");
-    });
-    miniCard.addEventListener("dragend", () => {
-      miniCard.classList.remove("dragging");
-      dragSrcGroupUid = null;
-      document.querySelectorAll(".drop-over").forEach((el) => el.classList.remove("drop-over"));
-    });
+  node.querySelector(".action-view").addEventListener("click", async (e) => {
+    e.stopPropagation();
+    await openOrFocusGroup(group);
   });
+
+  const removeEl = node.querySelector(".action-remove");
+  if (removeEl) {
+    removeEl.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const res = await sendMsg({ action: "removeGroupFromFolder", groupUid: group.uid });
+      if (res?.ok) {
+        showToast("Moved to Inbox", "success");
+        await loadData();
+        renderTree();
+      }
+    });
+  }
+
+  return node;
 }
 
-// ─── Category CRUD ────────────────────────────────────────────────────────────
-
-function openCategoryModal() {
-  document.getElementById("dash-category-name").value = "";
-  document.getElementById("dash-modal-overlay").classList.remove("hidden");
-  document.getElementById("dash-category-name").focus();
+async function openOrFocusGroup(group) {
+  if (group.active && group.chromeGroupId != null) {
+    try {
+      const cg = await chrome.tabGroups.get(group.chromeGroupId);
+      const tabs = await chrome.tabs.query({ groupId: group.chromeGroupId });
+      if (tabs[0]) {
+        await chrome.windows.update(cg.windowId, { focused: true });
+        await chrome.tabs.update(tabs[0].id, { active: true });
+      }
+      showToast("Focused group in Chrome", "info");
+    } catch (_) {
+      showToast("Group not available", "error");
+    }
+    return;
+  }
+  const res = await sendMsg({ action: "restoreGroup", groupUid: group.uid });
+  if (res?.ok) {
+    showToast("Group restored", "success");
+    await loadData();
+    renderTree();
+  } else if (res?.error) {
+    showToast(res.error, "error");
+  }
 }
 
-function closeCategoryModal() {
-  document.getElementById("dash-modal-overlay").classList.add("hidden");
-}
-
-async function confirmCreateCategory() {
-  const name = document.getElementById("dash-category-name").value.trim();
-  if (!name) return;
-  state.categories.push({ id: Date.now(), name, groupUids: [], collapsed: false });
-  await persistCategories();
-  closeCategoryModal();
-  showToast("Category created", "success");
-  render();
-}
-
-function startRenameCategory(cat, cardEl) {
-  const titleEl = cardEl.querySelector(".cat-card-title");
-  const current = cat.name;
+function startInlineRename(folder, wrapperEl) {
+  const nameEl = wrapperEl.querySelector(".tree-folder-name");
+  const current = folder.name;
   const input = document.createElement("input");
-  input.className = "inline-rename-dash";
+  input.type = "text";
+  input.className = "tree-folder-rename";
   input.value = current;
-  input.style.cssText = "flex:1;min-width:0;padding:4px 8px;background:var(--bg-tertiary);border:1px solid var(--accent);border-radius:6px;color:var(--text-primary);font-size:14px;font-weight:700;outline:none;";
-  titleEl.replaceWith(input);
+  input.style.cssText =
+    "flex:1;min-width:0;padding:3px 8px;background:var(--bg-tertiary);border:1px solid var(--accent);border-radius:5px;color:var(--text-primary);font-size:13px;font-weight:600;outline:none;";
+  nameEl.replaceWith(input);
   input.focus();
   input.select();
 
+  let committed = false;
   const commit = async () => {
+    if (committed) return;
+    committed = true;
     const newName = input.value.trim();
     if (newName && newName !== current) {
-      cat.name = newName;
-      await persistCategories();
-      showToast("Category renamed", "success");
+      const res = await sendMsg({ action: "renameFolder", folderId: folder.id, name: newName });
+      if (res?.ok) {
+        showToast("Folder renamed", "success");
+        await loadData();
+        renderTree();
+        return;
+      }
     }
-    render();
+    renderTree();
   };
 
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") commit();
-    if (e.key === "Escape") render();
+    if (e.key === "Escape") {
+      committed = true;
+      renderTree();
+    }
   });
   input.addEventListener("blur", commit);
 }
 
-async function deleteCategory(catId) {
-  state.categories = state.categories.filter((c) => c.id !== catId);
-  await persistCategories();
-  showToast("Category deleted", "success");
-  render();
+function destroySortables() {
+  sortableInstances.forEach((s) => {
+    try {
+      s.destroy();
+    } catch (_) {}
+  });
+  sortableInstances.length = 0;
 }
 
-// ─── Listeners ────────────────────────────────────────────────────────────────
+function initSortableEverywhere() {
+  if (typeof Sortable === "undefined") return;
+
+  document.querySelectorAll(".tree-list").forEach((listEl) => {
+    const isInbox = listEl.dataset.folderId === "inbox";
+    const instance = Sortable.create(listEl, {
+      group: "shared",
+      animation: 150,
+      fallbackOnBody: true,
+      swapThreshold: 0.65,
+      ghostClass: "sortable-ghost",
+      chosenClass: "sortable-chosen",
+      dragClass: "sortable-drag",
+      draggable: isInbox ? ".tree-group" : ".tree-folder, .tree-group",
+      onStart: () => {
+        document.querySelectorAll(".tree-list").forEach((el) => el.classList.add("drag-active"));
+      },
+      onEnd: async (evt) => {
+        document.querySelectorAll(".tree-list").forEach((el) => el.classList.remove("drag-active"));
+
+        const item = evt.item;
+        const targetList = evt.to;
+        if (!item || !targetList) {
+          renderTree();
+          return;
+        }
+
+        const folderIdAttr = targetList.dataset.folderId;
+        const targetFolderId = resolveTargetFolderId(folderIdAttr);
+
+        const itemType = item.dataset.itemType;
+        const itemId = itemType === "folder" ? item.dataset.folderId : item.dataset.groupUid;
+        if (!itemType || !itemId) {
+          renderTree();
+          return;
+        }
+
+        if (itemType === "folder" && targetFolderId === itemId) {
+          renderTree();
+          return;
+        }
+
+        const res = await sendMsg({
+          action: "moveItem",
+          itemType,
+          itemId,
+          targetFolderId,
+        });
+
+        if (!res?.ok) {
+          showToast("Move blocked (cycle or invalid)", "error");
+        }
+        await loadData();
+        renderTree();
+      },
+    });
+    sortableInstances.push(instance);
+  });
+}
+
+function openFolderModal(context) {
+  modalContext = context || { parentId: null };
+  const titleEl = document.getElementById("dash-modal-title");
+  const input = document.getElementById("dash-folder-name");
+  if (titleEl) {
+    titleEl.textContent = modalContext.parentId ? "Create Sub-folder" : "Create Folder";
+  }
+  if (input) {
+    input.value = "";
+    document.getElementById("dash-modal-overlay")?.classList.remove("hidden");
+    setTimeout(() => input.focus(), 50);
+  }
+}
+
+function closeFolderModal() {
+  modalContext = null;
+  document.getElementById("dash-modal-overlay")?.classList.add("hidden");
+}
+
+async function confirmCreateFolder() {
+  const input = document.getElementById("dash-folder-name");
+  const name = input?.value.trim();
+  if (!name) return;
+
+  const parentId = modalContext?.parentId ?? null;
+  const res = await sendMsg({ action: "createFolder", name, parentId });
+  closeFolderModal();
+
+  if (res?.ok) {
+    showToast("Folder created", "success");
+    await loadData();
+    renderTree();
+  } else {
+    showToast("Could not create folder", "error");
+  }
+}
 
 function bindListeners() {
   document.querySelectorAll(".nav-btn").forEach((btn) => {
     btn.addEventListener("click", () => switchView(btn.dataset.view));
   });
 
-  document.getElementById("btn-new-category").addEventListener("click", openCategoryModal);
-  document.getElementById("dash-modal-cancel").addEventListener("click", closeCategoryModal);
-  document.getElementById("dash-modal-confirm").addEventListener("click", confirmCreateCategory);
-  document.getElementById("dash-modal-overlay").addEventListener("click", (e) => {
-    if (e.target === e.currentTarget) closeCategoryModal();
-  });
-  document.getElementById("dash-category-name").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") confirmCreateCategory();
-    if (e.key === "Escape") closeCategoryModal();
+  document.getElementById("btn-new-folder")?.addEventListener("click", () => {
+    openFolderModal({ parentId: null });
   });
 
-  document.getElementById("welcome-banner-dismiss")?.addEventListener("click", dismissWelcomeBanner);
+  document.getElementById("dash-modal-cancel")?.addEventListener("click", closeFolderModal);
+  document.getElementById("dash-modal-confirm")?.addEventListener("click", confirmCreateFolder);
+  document.getElementById("dash-modal-overlay")?.addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) closeFolderModal();
+  });
+  document.getElementById("dash-folder-name")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") confirmCreateFolder();
+    if (e.key === "Escape") closeFolderModal();
+  });
 
   document.getElementById("btn-export-json")?.addEventListener("click", exportToJson);
-
-  document.querySelectorAll(".info-tooltip").forEach((el) => {
-    el.addEventListener("click", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-    });
-  });
-
-  document.querySelectorAll(".btn-copy").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = btn.dataset.copy;
-      const el = document.getElementById(id);
-      if (!el) return;
-      try {
-        await navigator.clipboard.writeText(el.textContent);
-        showToast("Copied to clipboard", "info");
-      } catch (_) {
-        showToast("Copy failed", "error");
-      }
-    });
-  });
 }
-
-// ─── JSON Export ──────────────────────────────────────────────────────────────
 
 async function exportToJson() {
   await loadData();
   const payload = {
     exportedAt: new Date().toISOString(),
     app: "TabGroup Master",
-    version: "1.0.0",
+    version: "2.0.0",
     savedGroups: state.savedGroups,
-    categories: state.categories,
+    folders: state.folders,
   };
   const json = JSON.stringify(payload, null, 2);
   const blob = new Blob([json], { type: "application/json" });
@@ -414,8 +531,6 @@ async function exportToJson() {
   showToast("Backup exported successfully", "success");
 }
 
-// ─── Toast ────────────────────────────────────────────────────────────────────
-
 function showToast(message, type = "info") {
   const container = document.getElementById("toast-container");
   if (!container || !message) return;
@@ -423,7 +538,9 @@ function showToast(message, type = "info") {
   toast.className = `toast toast-${type}`;
   toast.textContent = message;
   container.appendChild(toast);
-  requestAnimationFrame(() => requestAnimationFrame(() => toast.classList.add("toast-visible")));
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => toast.classList.add("toast-visible"));
+  });
   const dismiss = () => {
     toast.classList.remove("toast-visible");
     toast.classList.add("toast-out");
@@ -433,8 +550,6 @@ function showToast(message, type = "info") {
   };
   setTimeout(dismiss, 3000);
 }
-
-// ─── Utilities ────────────────────────────────────────────────────────────────
 
 function escHtml(str) {
   return String(str)
