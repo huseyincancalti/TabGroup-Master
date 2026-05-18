@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>TabGroup Master — Dashboard</title>
   <link rel="stylesheet" href="dashboard.css" />
+  <link rel="stylesheet" href="macro-wizard.css" />
 </head>
 <body>
 
@@ -70,6 +71,12 @@
               <li>Double-click and run the <code>install.bat</code> file inside the folder.</li>
               <li>The system will automatically detect your PC paths, mask your local username for privacy, and securely register the Native Host within Chrome. No manual JSON editing required!</li>
             </ol>
+            <button id="btn-run-macro" class="btn-primary btn-autoscan" type="button">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polygon points="5 3 19 12 5 21 5 3"/>
+              </svg>
+              Launch Auto-Scan
+            </button>
           </article>
 
           <section class="overview-support glass-panel">
@@ -178,9 +185,35 @@
     </div>
   </div>
 
+  <div id="autoscroll-wizard-modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="wizard-heading-step1">
+    <div class="autoscroll-wizard-card">
+      <div id="wizard-step-1" class="wizard-step">
+        <h2 id="wizard-heading-step1">🛠️ Native Host Setup Verification</h2>
+        <p>Before we map your workspace, have you executed the install.bat file inside your downloaded NativeHost folder?</p>
+        <div class="wizard-info-alert" role="note">
+          <span class="wizard-info-alert-label">💡 Note</span>
+          <p class="wizard-info-alert-text">If you have already executed it before and haven't moved or deleted the NativeHost folder, you don't need to run it again.</p>
+        </div>
+        <div class="wizard-actions">
+          <button id="wizard-verify-no" class="wizard-btn wizard-btn-muted" type="button">❌ No, I forgot</button>
+          <button id="wizard-verify-yes" class="wizard-btn wizard-btn-neon" type="button">✅ Yes, it's ready!</button>
+        </div>
+      </div>
+
+      <div id="wizard-step-2" class="wizard-step hidden">
+        <p class="wizard-context-warning">⚠️ Please keep Chrome open. The background macro is establishing a secure connection...</p>
+        <div class="wizard-gif-wrap">
+          <img src="macro-guide.gif" id="macro-guide-gif" alt="Auto-Scan guide animation" />
+        </div>
+        <div id="wizard-giant-countdown" class="wizard-giant-countdown" aria-live="assertive"></div>
+      </div>
+    </div>
+  </div>
+
   <div id="toast-container"></div>
 
   <script src="Sortable.min.js"></script>
+  <script src="macro-wizard.js"></script>
   <script src="dashboard.js"></script>
 </body>
 </html>

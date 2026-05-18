@@ -676,6 +676,9 @@ body {
   cursor: grab;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
   transition: background var(--transition), border-color var(--transition), transform var(--transition), box-shadow var(--transition);
+  /* Off-screen rendering offloaded to compositor — reduces paint cost for long lists */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 56px;
 }
 
 .group-card:hover {

@@ -18,11 +18,25 @@ let state = {
   searchQuery: "",
   editingGroupUid: null,
   activeTab: "active",
+  // Normalized O(1) indexes rebuilt after every loadData()
+  groupIndex: new Map(),   // uid -> group
+  conflictIndex: new Map(), // uid -> conflict
 };
 
 document.addEventListener("DOMContentLoaded", async () => {
   await loadData();
   bindStaticListeners();
+  MacroWizard.init({
+    showToast,
+    onImportModeEnabled: async () => {
+      state.importMode = true;
+      updateImportToggle();
+    },
+    onComplete: async () => {
+      await loadData();
+      render();
+    },
+  });
   render();
 });
 
@@ -47,6 +61,13 @@ async function loadData() {
   state.folders = store.folders || [];
   state.conflicts = store.conflicts || [];
   state.importMode = store.importMode || false;
+  buildIndexes();
+}
+
+// Build O(1) lookup Maps from flat arrays. Call after every state mutation.
+function buildIndexes() {
+  state.groupIndex = new Map(state.savedGroups.map((g) => [g.uid, g]));
+  state.conflictIndex = new Map(state.conflicts.map((c) => [c.uid, c]));
 }
 
 function sendMsg(message) {
@@ -99,7 +120,8 @@ function highlightTitle(title, query) {
 
 function conflictMatchesSearch(conflict, query) {
   if (!query) return true;
-  const saved = state.savedGroups.find((g) => g.uid === conflict.savedGroupUid);
+  // O(1) Map lookup instead of O(N) array scan
+  const saved = state.groupIndex.get(conflict.savedGroupUid);
   const incomingTitle = conflict.incomingGroup?.title || "";
   const savedTitle = saved ? (saved.title || "") : "";
   return titleMatchesSearch(incomingTitle, query) || titleMatchesSearch(savedTitle, query);
@@ -116,7 +138,6 @@ function render() {
 function renderActivePane() {
   const container = document.getElementById("active-groups-list");
   if (!container) return;
-  container.innerHTML = "";
 
   const active = state.savedGroups
     .filter((g) => g.active)
@@ -124,14 +145,18 @@ function renderActivePane() {
 
   document.getElementById("empty-active").classList.toggle("hidden", active.length > 0);
 
+  // Build off-DOM via DocumentFragment — single reflow on append
+  const frag = document.createDocumentFragment();
   active.forEach((group, index) => {
     const card = document.createElement("div");
     card.className = "group-card animate-in";
     card.style.animationDelay = `${index * 40}ms`;
     card.innerHTML = buildGroupCardHTML(group);
     bindGroupCardActions(card, group);
-    container.appendChild(card);
+    frag.appendChild(card);
   });
+  container.innerHTML = "";
+  container.appendChild(frag);
 }
 
 function buildGroupCardHTML(group) {
@@ -178,10 +203,15 @@ function bindGroupCardActions(card, group) {
   card.querySelector(".delete-active-btn").addEventListener("click", async (e) => {
     e.stopPropagation();
     if (!confirm(`Delete "${group.title || "Unnamed Group"}" permanently?`)) return;
-    await sendMsg({ action: "deleteGroup", groupUid: group.uid });
-    await loadData();
-    render();
+    // Optimistic: remove card from DOM immediately (0 ms perceived latency)
+    const cardEl = e.currentTarget.closest(".group-card") || card;
+    cardEl.remove();
+    state.savedGroups = state.savedGroups.filter((g) => g.uid !== group.uid);
+    buildIndexes();
+    document.getElementById("empty-active")?.classList.toggle("hidden", state.savedGroups.some((g) => g.active));
     showToast("Group deleted", "success");
+    // Async persistence — does not block UI
+    sendMsg({ action: "deleteGroup", groupUid: group.uid }).then(() => loadData().then(render));
   });
 
   card.querySelector(".toggle-group-btn").addEventListener("click", async (e) => {
@@ -209,11 +239,12 @@ function updateSavedEmptyState() {
 function renderSavedPane() {
   const container = document.getElementById("saved-groups-list");
   if (!container) return;
-  container.innerHTML = "";
 
   const inbox = getInboxGroups();
   updateSavedEmptyState();
 
+  // Build off-DOM via DocumentFragment — single reflow on append
+  const frag = document.createDocumentFragment();
   inbox.forEach((group, index) => {
     const dot = COLOR_HEX[group.color] || COLOR_HEX.grey;
     const title = highlightTitle(group.title, state.searchQuery);
@@ -255,19 +286,22 @@ function renderSavedPane() {
 
     card.querySelector(".delete-btn").addEventListener("click", async (e) => {
       e.stopPropagation();
+      // Optimistic: remove from DOM and local state immediately
       const cardEl = e.currentTarget.closest(".saved-group-card") || card;
       cardEl.remove();
       state.savedGroups = state.savedGroups.filter((g) => g.uid !== group.uid);
+      buildIndexes();
       updateSavedEmptyState();
-
-      await sendMsg({ action: "deleteGroup", groupUid: group.uid });
-      await loadData();
-      renderSavedPane();
       showToast("Group deleted", "success");
+      // Async persistence
+      sendMsg({ action: "deleteGroup", groupUid: group.uid }).then(() => loadData().then(renderSavedPane));
     });
 
-    container.appendChild(card);
+    frag.appendChild(card);
   });
+
+  container.innerHTML = "";
+  container.appendChild(frag);
 }
 
 function renderConflictsPane() {
@@ -282,7 +316,8 @@ function renderConflictsPane() {
   document.getElementById("empty-conflicts").classList.toggle("hidden", unresolved.length > 0);
 
   unresolved.forEach((conflict, index) => {
-    const saved = state.savedGroups.find((g) => g.uid === conflict.savedGroupUid);
+    // O(1) Map lookup
+    const saved = state.groupIndex.get(conflict.savedGroupUid);
     const incoming = conflict.incomingGroup;
     const dot = COLOR_HEX[incoming?.color] || COLOR_HEX.grey;
     const inTitle = highlightTitle(incoming?.title, state.searchQuery);
@@ -322,8 +357,10 @@ function renderConflictsPane() {
       render();
     });
 
-    container.appendChild(card);
+    frag.appendChild(card);
   });
+  container.innerHTML = "";
+  container.appendChild(frag);
 }
 
 function updateConflictBadge() {
@@ -422,83 +459,6 @@ function bindStaticListeners() {
     if (e.key === "Escape") closeEditModal();
   });
 
-  document.getElementById("btn-run-macro").addEventListener("click", () => {
-    openMacroGuideModal();
-  });
-
-  document.getElementById("macro-start-btn")?.addEventListener("click", startMacroScan);
-  document.getElementById("macro-cancel-btn")?.addEventListener("click", closeMacroGuideModal);
-  document.getElementById("macro-guide-modal")?.addEventListener("click", (e) => {
-    if (e.target === e.currentTarget && !macroScanRunning) closeMacroGuideModal();
-  });
-}
-
-let macroScanAbort = false;
-let macroScanRunning = false;
-
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-
-function resetMacroGuideModal() {
-  macroScanAbort = false;
-  macroScanRunning = false;
-  const cd = document.getElementById("macro-countdown");
-  if (cd) { cd.textContent = ""; cd.classList.remove("pulse"); }
-  const status = document.getElementById("macro-scan-status");
-  if (status) { status.textContent = ""; status.classList.add("hidden"); status.classList.remove("scanning"); }
-  document.getElementById("macro-guide-actions")?.classList.remove("hidden");
-}
-
-function openMacroGuideModal() {
-  resetMacroGuideModal();
-  document.getElementById("macro-guide-modal")?.classList.remove("hidden");
-}
-
-function closeMacroGuideModal() {
-  macroScanAbort = true;
-  document.getElementById("macro-guide-modal")?.classList.add("hidden");
-  resetMacroGuideModal();
-}
-
-async function startMacroScan() {
-  if (macroScanRunning) return;
-  macroScanAbort = false;
-  macroScanRunning = true;
-
-  const countdownEl = document.getElementById("macro-countdown");
-  const statusEl = document.getElementById("macro-scan-status");
-  const actionsEl = document.getElementById("macro-guide-actions");
-
-  actionsEl?.classList.add("hidden");
-  statusEl?.classList.add("hidden");
-
-  for (let i = 3; i >= 1; i--) {
-    if (macroScanAbort) { macroScanRunning = false; return; }
-    if (countdownEl) {
-      countdownEl.textContent = String(i);
-      countdownEl.classList.remove("pulse");
-      void countdownEl.offsetWidth;
-      countdownEl.classList.add("pulse");
-    }
-    await sleep(1000);
-  }
-
-  if (macroScanAbort) { macroScanRunning = false; return; }
-
-  if (countdownEl) countdownEl.textContent = "";
-  if (statusEl) {
-    statusEl.textContent = "Scanning… Do not move your mouse.";
-    statusEl.classList.remove("hidden");
-    statusEl.classList.add("scanning");
-  }
-
-  const res = await sendMsg({ action: "runNativeMacro" });
-  macroScanRunning = false;
-  closeMacroGuideModal();
-
-  if (res?.ok) showToast("Auto-Scan completed!", "success");
-  else if (res?.error) showToast(res.error, "error");
-  await loadData();
-  render();
 }
 
 function showToast(message, type = "info") {

@@ -9,6 +9,12 @@ let state = {
   savedGroups: [],
   folders: [],
   activeView: "overview",
+  // Normalized O(1) indexes rebuilt after every loadData() / state mutation
+  groupIndex: new Map(),          // uid -> group
+  folderIndex: new Map(),         // id  -> folder
+  childFoldersByParent: new Map(),// parentKey -> folder[]
+  childGroupsByFolder: new Map(), // folderId  -> group[]
+  inboxGroups: [],
 };
 
 let modalContext = null;
@@ -17,6 +23,16 @@ const sortableInstances = [];
 document.addEventListener("DOMContentLoaded", async () => {
   await loadData();
   bindListeners();
+  MacroWizard.init({
+    showToast,
+    onImportModeEnabled: async () => {
+      await loadData();
+    },
+    onComplete: async () => {
+      await loadData();
+      render();
+    },
+  });
   render();
 });
 
@@ -58,6 +74,33 @@ async function loadData() {
     parentId: f.parentId ?? null,
     isExpanded: f.isExpanded !== false,
   }));
+  buildIndexes();
+}
+
+// Rebuild all O(1) lookup indexes from the flat arrays.
+// Must be called after any in-place state mutation.
+function buildIndexes() {
+  state.groupIndex = new Map(state.savedGroups.map((g) => [g.uid, g]));
+  state.folderIndex = new Map(state.folders.map((f) => [f.id, f]));
+
+  state.childFoldersByParent = new Map();
+  state.childGroupsByFolder = new Map();
+  state.inboxGroups = [];
+
+  for (const f of state.folders) {
+    const key = f.parentId ?? "__root__";
+    if (!state.childFoldersByParent.has(key)) state.childFoldersByParent.set(key, []);
+    state.childFoldersByParent.get(key).push(f);
+  }
+
+  for (const g of state.savedGroups) {
+    if (g.folderId) {
+      if (!state.childGroupsByFolder.has(g.folderId)) state.childGroupsByFolder.set(g.folderId, []);
+      state.childGroupsByFolder.get(g.folderId).push(g);
+    } else if (!g.active) {
+      state.inboxGroups.push(g);
+    }
+  }
 }
 
 function switchView(view) {
@@ -83,15 +126,17 @@ function isRootParent(parentId) {
   return parentId == null || parentId === "";
 }
 
+// O(1) index-backed lookups — replace former O(N) array filters
 function getChildFolders(parentId) {
-  return state.folders
-    .filter((f) => (f.parentId ?? null) === (parentId ?? null))
+  const key = parentId ?? "__root__";
+  return (state.childFoldersByParent.get(key) || [])
+    .slice()
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function getChildGroups(folderId) {
-  return state.savedGroups
-    .filter((g) => g.folderId === folderId)
+  return (state.childGroupsByFolder.get(folderId) || [])
+    .slice()
     .sort((a, b) => {
       if (a.active !== b.active) return a.active ? -1 : 1;
       return (a.title || "").localeCompare(b.title || "");
@@ -99,8 +144,8 @@ function getChildGroups(folderId) {
 }
 
 function getInboxGroups() {
-  return state.savedGroups
-    .filter((g) => !g.active && (g.folderId == null || g.folderId === undefined))
+  return (state.inboxGroups || [])
+    .slice()
     .sort((a, b) => (a.title || "").localeCompare(b.title || ""));
 }
 
@@ -117,14 +162,15 @@ function renderInbox() {
   const countEl = document.getElementById("inbox-count");
   if (!list) return;
 
-  list.innerHTML = "";
   const groups = getInboxGroups();
-  groups.forEach((group) => list.appendChild(buildGroupNode(group, { inInbox: true })));
+  // Build off-DOM via DocumentFragment — single reflow
+  const frag = document.createDocumentFragment();
+  groups.forEach((group) => frag.appendChild(buildGroupNode(group, { inInbox: true })));
+  list.innerHTML = "";
+  list.appendChild(frag);
 
   if (countEl) countEl.textContent = String(groups.length);
-  if (empty) {
-    empty.classList.toggle("hidden", groups.length > 0);
-  }
+  if (empty) empty.classList.toggle("hidden", groups.length > 0);
 }
 
 function renderFoldersTree() {
@@ -133,20 +179,18 @@ function renderFoldersTree() {
   const countEl = document.getElementById("tree-count");
   if (!root) return;
 
-  root.innerHTML = "";
-
   const rootFolders = getChildFolders(null);
-  rootFolders.forEach((folder) => {
-    root.appendChild(buildFolderNode(folder));
-  });
+
+  // Build off-DOM via DocumentFragment — single reflow
+  const frag = document.createDocumentFragment();
+  rootFolders.forEach((folder) => frag.appendChild(buildFolderNode(folder)));
+  root.innerHTML = "";
+  root.appendChild(frag);
 
   const organizedCount = state.savedGroups.filter((g) => g.folderId).length;
   const total = state.folders.length + organizedCount;
   if (countEl) countEl.textContent = String(total);
-
-  if (empty) {
-    empty.classList.toggle("hidden", rootFolders.length > 0);
-  }
+  if (empty) empty.classList.toggle("hidden", rootFolders.length > 0);
 }
 
 function renderTree() {
@@ -211,8 +255,11 @@ function buildFolderNode(folder) {
   `;
 
   const body = wrapper.querySelector(".tree-folder-body");
-  childFolders.forEach((child) => body.appendChild(buildFolderNode(child)));
-  childGroups.forEach((group) => body.appendChild(buildGroupNode(group)));
+  // Use DocumentFragment for folder body too
+  const bodyFrag = document.createDocumentFragment();
+  childFolders.forEach((child) => bodyFrag.appendChild(buildFolderNode(child)));
+  childGroups.forEach((group) => bodyFrag.appendChild(buildGroupNode(group)));
+  body.appendChild(bodyFrag);
 
   const chevron = wrapper.querySelector(".tree-chevron");
   chevron.addEventListener("click", async (e) => {
@@ -302,14 +349,19 @@ function buildGroupNode(group, options = {}) {
 
   const removeEl = node.querySelector(".action-remove");
   if (removeEl) {
-    removeEl.addEventListener("click", async (e) => {
+    removeEl.addEventListener("click", (e) => {
       e.stopPropagation();
-      const res = await sendMsg({ action: "removeGroupFromFolder", groupUid: group.uid });
-      if (res?.ok) {
-        showToast("Moved to Inbox", "success");
-        await loadData();
-        renderTree();
+      // Optimistic: remove node from DOM and update indexes instantly
+      node.remove();
+      const g = state.groupIndex.get(group.uid);
+      if (g) {
+        g.folderId = null;
+        buildIndexes();
       }
+      showToast("Moved to Inbox", "success");
+      // Async persistence — does not block UI
+      sendMsg({ action: "removeGroupFromFolder", groupUid: group.uid })
+        .then(() => loadData().then(renderTree));
     });
   }
 
@@ -432,18 +484,25 @@ function initSortableEverywhere() {
           return;
         }
 
-        const res = await sendMsg({
-          action: "moveItem",
-          itemType,
-          itemId,
-          targetFolderId,
-        });
-
-        if (!res?.ok) {
-          showToast("Move blocked (cycle or invalid)", "error");
+        // Optimistic state update — SortableJS already moved the DOM node
+        if (itemType === "group") {
+          const g = state.groupIndex?.get(itemId);
+          if (g) { g.folderId = targetFolderId; buildIndexes(); }
+        } else if (itemType === "folder") {
+          const f = state.folderIndex?.get(itemId);
+          if (f) { f.parentId = targetFolderId; buildIndexes(); }
         }
-        await loadData();
-        renderTree();
+
+        // Fire to background asynchronously — no UI block
+        sendMsg({ action: "moveItem", itemType, itemId, targetFolderId })
+          .then(async (res) => {
+            if (!res?.ok) {
+              showToast("Move blocked (cycle or invalid)", "error");
+              await loadData();
+              renderTree();
+            }
+            // On success, storage.onChanged triggers a background reconcile
+          });
       },
     });
     sortableInstances.push(instance);

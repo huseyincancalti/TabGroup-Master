@@ -431,6 +431,23 @@ body {
     inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
+.btn-autoscan {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 20px;
+  width: 100%;
+  justify-content: center;
+  background: linear-gradient(135deg, #7c3aed 0%, #8a2be2 55%, #a855f7 100%);
+  border: 1px solid rgba(168, 85, 247, 0.55);
+  box-shadow: 0 0 18px rgba(138, 43, 226, 0.35);
+}
+
+.btn-autoscan:hover {
+  box-shadow: 0 0 26px rgba(138, 43, 226, 0.5);
+  filter: brightness(1.06);
+}
+
 .macro-setup-header {
   display: flex;
   align-items: center;
@@ -735,6 +752,9 @@ body {
   border: 1px solid transparent;
   transition: background var(--transition), border-color var(--transition);
   user-select: none;
+  /* Off-screen rendering offloaded to compositor */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 44px;
 }
 
 .tree-group:hover {

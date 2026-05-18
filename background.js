@@ -79,6 +79,28 @@ async function snapshotLiveGroups() {
 let syncing = false;
 let syncPending = false;
 
+// ─── Scan Mutex ───────────────────────────────────────────────────────────────
+// When a native macro is running, suppress tab-event storms.  Any events that
+// arrive while isScanning is true are coalesced into a single final reconcile
+// that runs once the lock is released.
+
+let isScanning = false;
+let scanTimeoutId = null;
+const SCAN_LOCK_MAX_MS = 10_000;
+
+function acquireScanLock() {
+  isScanning = true;
+  clearTimeout(scanTimeoutId);
+  scanTimeoutId = setTimeout(() => releaseScanLock(true), SCAN_LOCK_MAX_MS);
+}
+
+function releaseScanLock(runFinalSync = false) {
+  isScanning = false;
+  clearTimeout(scanTimeoutId);
+  if (runFinalSync) syncGroups();
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function syncGroups() {
   if (syncing) {
     syncPending = true;
@@ -183,14 +205,18 @@ async function syncGroupsInner() {
 
 // ─── Listeners ───────────────────────────────────────────────────────────────
 
-chrome.tabGroups.onCreated.addListener(() => syncGroups());
-chrome.tabGroups.onUpdated.addListener(() => syncGroups());
-chrome.tabGroups.onRemoved.addListener(() => syncGroups());
+// All tab/group change listeners are gated by the scan mutex so that a native
+// macro running in the background does not trigger hundreds of redundant syncs.
+function guardedSync() { if (!isScanning) syncGroups(); }
+
+chrome.tabGroups.onCreated.addListener(guardedSync);
+chrome.tabGroups.onUpdated.addListener(guardedSync);
+chrome.tabGroups.onRemoved.addListener(guardedSync);
 chrome.tabs.onUpdated.addListener((_id, info) => {
-  if (info.groupId !== undefined || info.title || info.url) syncGroups();
+  if (!isScanning && (info.groupId !== undefined || info.title || info.url)) syncGroups();
 });
-chrome.tabs.onRemoved.addListener(() => syncGroups());
-chrome.tabs.onCreated.addListener(() => syncGroups());
+chrome.tabs.onRemoved.addListener(guardedSync);
+chrome.tabs.onCreated.addListener(guardedSync);
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   const h = handlers[msg.action];
@@ -209,15 +235,45 @@ const handlers = {
     return { ok: true };
   },
 
+  async warmupNativeHost() {
+    return new Promise((resolve) => {
+      chrome.runtime.sendNativeMessage(
+        "com.tabgroup.master",
+        { command: "PING" },
+        () => {
+          resolve({
+            ok: !chrome.runtime.lastError,
+            error: chrome.runtime.lastError?.message || null,
+          });
+        }
+      );
+    });
+  },
+
+  async syncGroupsNow() {
+    // Called by wizard after macro finishes — release the scan lock first so
+    // syncGroups() is allowed to run, then broadcast the result.
+    releaseScanLock(false);
+    await syncGroups();
+    broadcast({ type: "STORE_UPDATED" });
+    return { ok: true };
+  },
+
   async runNativeMacro() {
+    // Acquire the scan lock before firing the macro so incoming tab-change
+    // events during execution are suppressed.
+    acquireScanLock();
     return new Promise((resolve) => {
       chrome.runtime.sendNativeMessage(
         "com.tabgroup.master",
         { command: "START_MACRO" },
         (response) => {
           if (chrome.runtime.lastError) {
+            // On error release immediately and let a sync run.
+            releaseScanLock(true);
             resolve({ ok: false, error: chrome.runtime.lastError.message });
           } else {
+            // Lock stays active; syncGroupsNow will release it.
             resolve({ ok: true, response });
           }
         }

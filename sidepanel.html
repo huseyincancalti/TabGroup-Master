@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>TabGroup Master</title>
   <link rel="stylesheet" href="sidepanel.css" />
+  <link rel="stylesheet" href="macro-wizard.css" />
 </head>
 <body>
 
@@ -131,22 +132,34 @@
     </div>
   </div>
 
-  <div id="macro-guide-modal" class="hidden">
-    <div class="macro-guide-dialog glass-modal">
-      <h3>Auto-Scan Guide</h3>
-      <img src="macro-guide.gif" id="macro-guide-gif" alt="Macro Guide" style="width:100%; border-radius:8px; margin-bottom:15px;">
-      <p class="macro-guide-instruction">Move your mouse exactly where the GIF shows (The Tab Groups Grid Icon).</p>
-      <div id="macro-countdown" class="macro-countdown" aria-live="polite"></div>
-      <p id="macro-scan-status" class="macro-scan-status hidden"></p>
-      <div id="macro-guide-actions" class="macro-guide-actions">
-        <button id="macro-start-btn" class="btn-primary" type="button">Start Scan</button>
-        <button id="macro-cancel-btn" class="btn-secondary" type="button">Cancel</button>
+  <div id="autoscroll-wizard-modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="wizard-heading-step1">
+    <div class="autoscroll-wizard-card">
+      <div id="wizard-step-1" class="wizard-step">
+        <h2 id="wizard-heading-step1">🛠️ Native Host Setup Verification</h2>
+        <p>Before we map your workspace, have you executed the install.bat file inside your downloaded NativeHost folder?</p>
+        <div class="wizard-info-alert" role="note">
+          <span class="wizard-info-alert-label">💡 Note</span>
+          <p class="wizard-info-alert-text">If you have already executed it before and haven't moved or deleted the NativeHost folder, you don't need to run it again.</p>
+        </div>
+        <div class="wizard-actions">
+          <button id="wizard-verify-no" class="wizard-btn wizard-btn-muted" type="button">❌ No, I forgot</button>
+          <button id="wizard-verify-yes" class="wizard-btn wizard-btn-neon" type="button">✅ Yes, it's ready!</button>
+        </div>
+      </div>
+
+      <div id="wizard-step-2" class="wizard-step hidden">
+        <p class="wizard-context-warning">⚠️ Please keep Chrome open. The background macro is establishing a secure connection...</p>
+        <div class="wizard-gif-wrap">
+          <img src="macro-guide.gif" id="macro-guide-gif" alt="Auto-Scan guide animation" />
+        </div>
+        <div id="wizard-giant-countdown" class="wizard-giant-countdown" aria-live="assertive"></div>
       </div>
     </div>
   </div>
 
   <div id="toast-container"></div>
 
+  <script src="macro-wizard.js"></script>
   <script src="sidepanel.js"></script>
 </body>
 </html>
