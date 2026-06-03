@@ -61,6 +61,69 @@ async function getStore() {
 
 async function setStore(partial) {
   await chrome.storage.local.set(partial);
+  scheduleSyncBackup();
+}
+
+// ── Cloud backup ─────────────────────────────────────────────────────────────
+// Keeps a compact copy in chrome.storage.sync so data survives profile sign-outs.
+// Tabs are NOT backed up (they can be re-imported from Chrome).
+
+const SYNC_META_KEY = "bkmeta";
+const SYNC_CHUNK_KEY = "bk";
+const SYNC_CHUNK_SIZE = 7800; // safely under Chrome's 8192 bytes/item limit
+
+let _syncTimer = null;
+
+function scheduleSyncBackup() {
+  clearTimeout(_syncTimer);
+  _syncTimer = setTimeout(doSyncBackup, 8000); // 8-second debounce — don't hammer sync
+}
+
+async function doSyncBackup() {
+  try {
+    const store = await getStore();
+    const payload = JSON.stringify({
+      v: 3, ts: Date.now(),
+      g: store.savedGroups.map(g => [
+        g.uid, g.title || "", g.color || "grey",
+        g.folderId || null, g.tabCount || 0, g.savedAt || 0,
+      ]),
+      f: store.folders,
+    });
+    const chunks = [];
+    for (let i = 0; i < payload.length; i += SYNC_CHUNK_SIZE) {
+      chunks.push(payload.slice(i, i + SYNC_CHUNK_SIZE));
+    }
+    const obj = { [SYNC_META_KEY]: { n: chunks.length, ts: Date.now(), gc: store.savedGroups.length } };
+    chunks.forEach((c, i) => { obj[SYNC_CHUNK_KEY + i] = c; });
+    await chrome.storage.sync.set(obj);
+    // Remove stale extra chunks from a previous larger backup
+    const staleKeys = Array.from({ length: 20 }, (_, i) => SYNC_CHUNK_KEY + (chunks.length + i));
+    chrome.storage.sync.remove(staleKeys).catch(() => {});
+  } catch (_) { /* quota exceeded or sync disabled — skip silently */ }
+}
+
+async function restoreFromCloud() {
+  try {
+    const local = await chrome.storage.local.get(["savedGroups", "folders"]);
+    if ((local.savedGroups || []).length > 0 || (local.folders || []).length > 0) return;
+    const meta = (await chrome.storage.sync.get(SYNC_META_KEY))[SYNC_META_KEY];
+    if (!meta?.n) return;
+    const chunkKeys = Array.from({ length: meta.n }, (_, i) => SYNC_CHUNK_KEY + i);
+    const chunks = await chrome.storage.sync.get(chunkKeys);
+    const json = chunkKeys.map(k => chunks[k] || "").join("");
+    if (!json) return;
+    const data = JSON.parse(json);
+    if (!Array.isArray(data?.g) || !data.g.length) return;
+    const savedGroups = data.g.map(([u, t, c, f, n, s]) => normalizeGroup({
+      uid: u, title: t, color: c, folderId: f,
+      tabCount: n, savedAt: s,
+      active: false, chromeGroupId: null, tabs: [], tabsLoaded: false,
+    }));
+    const folders = (data.f || []).map(normalizeFolder);
+    await chrome.storage.local.set({ savedGroups, folders });
+    broadcast({ type: "RESTORED_FROM_CLOUD", groupCount: savedGroups.length, folderCount: folders.length });
+  } catch (_) { /* restore failed — skip silently */ }
 }
 
 function buildIndexes(store) {
@@ -511,4 +574,5 @@ const handlers = {
   },
 };
 
-reconcile();
+// On startup: restore from sync backup if local storage is empty, then reconcile live tabs.
+restoreFromCloud().then(() => reconcile());

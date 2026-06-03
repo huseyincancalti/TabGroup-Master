@@ -246,6 +246,33 @@
           </article>
 
           <article class="settings-card glass-panel">
+            <h3>Native Host Diagnostics</h3>
+            <p class="settings-desc">Troubleshoot the native messaging connection. If Import fails, test here first.</p>
+            <div class="diag-info">
+              <div class="diag-row">
+                <span class="diag-label">Extension ID</span>
+                <code id="diag-ext-id" class="diag-value">—</code>
+              </div>
+            </div>
+            <div class="settings-actions" style="margin-bottom:12px;">
+              <button id="btn-test-native" class="btn-secondary" type="button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;margin-right:5px;"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07A19.5 19.5 0 013.07 9.8 19.79 19.79 0 01.37 1.18 2 2 0 012.35 0h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L6.91 7.91a16 16 0 006.1 6.1l.79-.79a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>
+                Test Connection
+              </button>
+            </div>
+            <div id="diag-result" class="diag-result hidden"></div>
+            <details class="diag-steps-details">
+              <summary class="diag-steps-summary">Troubleshooting steps</summary>
+              <ol class="setup-steps" style="margin-top:10px;">
+                <li>Run <code>NativeHost\install.bat</code> as the current Windows user (double-click).</li>
+                <li>Fully close Chrome — <strong>all windows</strong>. Open Task Manager and end any remaining <code>chrome.exe</code> processes.</li>
+                <li>Re-open Chrome, reload the extension at <code>chrome://extensions</code>, then test again.</li>
+                <li>If still failing, open <code>NativeHost\com.tabgroup.master.json</code> and verify the <code>allowed_origins</code> value matches the Extension ID shown above.</li>
+              </ol>
+            </details>
+          </article>
+
+          <article class="settings-card glass-panel">
             <h3>Language (i18n)</h3>
             <p class="settings-desc">Multi-language support coming soon. JSON translation files will plug in here.</p>
             <div class="lang-field">

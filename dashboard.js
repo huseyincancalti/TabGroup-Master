@@ -25,6 +25,10 @@ let modalContext = null;
 const sortableInstances = [];
 
 document.addEventListener("DOMContentLoaded", async () => {
+  // Show extension ID in diagnostics panel
+  const extIdEl = document.getElementById("diag-ext-id");
+  if (extIdEl) extIdEl.textContent = chrome.runtime.id;
+
   await loadData();
   bindListeners();
   render();
@@ -39,9 +43,15 @@ chrome.storage.onChanged.addListener(async (changes, area) => {
 });
 
 chrome.runtime.onMessage.addListener(async (message) => {
-  if (!message || message.type !== "STORE_UPDATED") return;
-  await loadData();
-  render();
+  if (!message) return;
+  if (message.type === "STORE_UPDATED") {
+    await loadData();
+    render();
+  } else if (message.type === "RESTORED_FROM_CLOUD") {
+    await loadData();
+    render();
+    showToast(`♻️ Restored ${message.groupCount} groups + ${message.folderCount} folders from sync backup`, "info");
+  }
 });
 
 function sendMsg(message) {
@@ -580,6 +590,48 @@ function renderCleanup() {
   renderCleanupDuplicates();
 }
 
+// ── Cleanup helpers ───────────────────────────────────────────────────────────
+
+async function toggleCleanupTabs(listEl, group) {
+  if (!listEl.classList.contains("hidden")) {
+    listEl.classList.add("hidden");
+    return;
+  }
+  listEl.classList.remove("hidden");
+  if (group.tabsLoaded && group.tabs?.length) {
+    _renderCleanupTabsList(listEl, group.tabs);
+    return;
+  }
+  listEl.innerHTML = '<li class="cleanup-tab-loading">Loading…</li>';
+  const res = await sendMsg({ action: "loadGroupTabs", groupUid: group.uid });
+  if (!res?.ok) {
+    listEl.innerHTML = '<li class="cleanup-tab-empty">Could not load tabs</li>';
+    return;
+  }
+  group.tabs = res.tabs || [];
+  group.tabCount = group.tabs.length;
+  group.tabsLoaded = true;
+  const indexed = state.groupIndex.get(group.uid);
+  if (indexed) { indexed.tabs = group.tabs; indexed.tabCount = group.tabCount; indexed.tabsLoaded = true; }
+  _renderCleanupTabsList(listEl, group.tabs);
+}
+
+function _renderCleanupTabsList(listEl, tabs) {
+  listEl.innerHTML = "";
+  if (!tabs.length) { listEl.innerHTML = '<li class="cleanup-tab-empty">No tabs stored — re-import from Chrome to populate</li>'; return; }
+  const frag = document.createDocumentFragment();
+  tabs.forEach((t) => {
+    const li = document.createElement("li");
+    li.className = "cleanup-tab-item";
+    const favicon = t.favIconUrl
+      ? `<img class="cleanup-tab-favicon" src="${escHtml(t.favIconUrl)}" alt="" />`
+      : '<span class="cleanup-tab-favicon-placeholder"></span>';
+    li.innerHTML = `${favicon}<span class="cleanup-tab-text" title="${escHtml(t.url || "")}">${escHtml(t.title || t.url || "Untitled")}</span>`;
+    frag.appendChild(li);
+  });
+  listEl.appendChild(frag);
+}
+
 function renderCleanupUnnamed() {
   const container = document.getElementById("cleanup-unnamed-list");
   const badge = document.getElementById("cleanup-unnamed-badge");
@@ -603,9 +655,12 @@ function renderCleanupUnnamed() {
 
   const frag = document.createDocumentFragment();
   groups.forEach((group) => {
+    const wrapper = document.createElement("div");
+    wrapper.className = "cleanup-row-wrap";
+    wrapper.dataset.uid = group.uid;
+
     const row = document.createElement("div");
     row.className = "cleanup-row";
-    row.dataset.uid = group.uid;
     const dot = COLOR_HEX[group.color] || COLOR_HEX.grey;
     const tabs = group.tabCount || 0;
     const displayTitle = (group.title || "").trim() || "Unnamed";
@@ -613,19 +668,33 @@ function renderCleanupUnnamed() {
       <input type="checkbox" class="cleanup-check" />
       <span class="cleanup-dot" style="background:${dot}"></span>
       <span class="cleanup-title" title="${escHtml(displayTitle)}">${escHtml(displayTitle)}</span>
-      <span class="cleanup-tabcount">${tabs} tab${tabs !== 1 ? "s" : ""}</span>
+      <span class="cleanup-tabcount" title="Click to preview tabs">${tabs} tab${tabs !== 1 ? "s" : ""} <svg class="expand-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
       <button class="cleanup-btn-del" type="button" title="Delete this group">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
       </button>
     `;
+
+    const tabList = document.createElement("ul");
+    tabList.className = "cleanup-tabs-list hidden";
+
+    row.querySelector(".cleanup-tabcount").addEventListener("click", (e) => {
+      e.stopPropagation();
+      const chevron = row.querySelector(".expand-chevron");
+      chevron?.classList.toggle("open", tabList.classList.contains("hidden"));
+      toggleCleanupTabs(tabList, group);
+    });
+
     row.querySelector(".cleanup-btn-del").addEventListener("click", async () => {
-      row.remove();
+      wrapper.remove();
       state.savedGroups = state.savedGroups.filter((g) => g.uid !== group.uid);
       buildIndexes();
       showToast("Deleted", "success");
       await sendMsg({ action: "deleteGroup", groupUid: group.uid });
     });
-    frag.appendChild(row);
+
+    wrapper.appendChild(row);
+    wrapper.appendChild(tabList);
+    frag.appendChild(wrapper);
   });
   container.innerHTML = "";
   container.appendChild(frag);
@@ -685,18 +754,37 @@ function renderCleanupDuplicates() {
       const where = g.folderId
         ? (state.folderIndex.get(g.folderId)?.name || "folder")
         : "Inbox";
+
+      const rowWrap = document.createElement("div");
+      rowWrap.className = "cleanup-dup-row-wrap";
+
       const row = document.createElement("div");
       row.className = "cleanup-dup-row";
       row.innerHTML = `
         <span class="cleanup-dot" style="background:${dot}"></span>
-        <span class="cleanup-dup-row-info">${tabs} tab${tabs !== 1 ? "s" : ""} · ${escHtml(where)}</span>
+        <span class="cleanup-dup-row-info" title="Click to preview tabs">
+          ${tabs} tab${tabs !== 1 ? "s" : ""} · ${escHtml(where)}
+          <svg class="expand-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        </span>
         ${idx === 0
           ? `<span class="cleanup-keep-badge">Keep</span>`
           : `<button class="cleanup-btn-del-dup" type="button">Delete</button>`
         }
       `;
+
+      const tabList = document.createElement("ul");
+      tabList.className = "cleanup-tabs-list hidden";
+
+      row.querySelector(".cleanup-dup-row-info").addEventListener("click", (e) => {
+        e.stopPropagation();
+        const chevron = row.querySelector(".expand-chevron");
+        chevron?.classList.toggle("open", tabList.classList.contains("hidden"));
+        toggleCleanupTabs(tabList, g);
+      });
+
       if (idx > 0) {
-        row.querySelector(".cleanup-btn-del-dup").addEventListener("click", async () => {
+        row.querySelector(".cleanup-btn-del-dup").addEventListener("click", async (e) => {
+          e.stopPropagation();
           card.remove();
           await sendMsg({ action: "deleteGroup", groupUid: g.uid });
           await loadData();
@@ -704,7 +792,10 @@ function renderCleanupDuplicates() {
           showToast("Deleted", "success");
         });
       }
-      rowsEl.appendChild(row);
+
+      rowWrap.appendChild(row);
+      rowWrap.appendChild(tabList);
+      rowsEl.appendChild(rowWrap);
     });
 
     card.querySelector(".cleanup-btn-merge").addEventListener("click", async () => {
@@ -919,6 +1010,39 @@ function bindListeners() {
   document.getElementById("cleanup-search")?.addEventListener("input", (e) => {
     state.cleanupFilter = e.target.value;
     renderCleanup();
+  });
+
+  // ── Diagnostics ──────────────────────────────────────────────────────────────
+  document.getElementById("btn-test-native")?.addEventListener("click", async () => {
+    const btn = document.getElementById("btn-test-native");
+    const resultEl = document.getElementById("diag-result");
+    if (!btn || !resultEl) return;
+    btn.disabled = true;
+    btn.textContent = "Testing…";
+    resultEl.classList.remove("hidden");
+    resultEl.innerHTML = '<p class="diag-testing">Connecting to native host…</p>';
+    try {
+      const res = await sendMsg({ action: "listChromeProfiles" });
+      if (res?.ok) {
+        const profiles = res.profiles || [];
+        resultEl.innerHTML = `
+          <p class="diag-ok">✅ Connection successful</p>
+          <p class="diag-detail">${profiles.length} Chrome profile(s) found:</p>
+          <ul class="diag-list">
+            ${profiles.map(p => `<li>${escHtml(p.displayName || p.profileName)}${p.email ? ` — <span class="diag-email">${escHtml(p.email)}</span>` : ""}</li>`).join("")}
+          </ul>`;
+      } else {
+        resultEl.innerHTML = `
+          <p class="diag-err">❌ Connection failed</p>
+          <p class="diag-detail">${escHtml(res?.error || "Unknown error")}</p>
+          <p class="diag-hint">Run <code>NativeHost\\install.bat</code>, then fully close Chrome (all windows + Task Manager → kill chrome.exe), and reopen.</p>`;
+      }
+    } catch (e) {
+      resultEl.innerHTML = `<p class="diag-err">❌ ${escHtml(e.message)}</p>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Test Connection";
+    }
   });
 
   document.getElementById("btn-refresh-workspace")?.addEventListener("click", refreshWorkspace);

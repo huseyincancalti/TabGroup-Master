@@ -1389,6 +1389,155 @@ body {
 .cleanup-dup-footer { display: flex; gap: 8px; }
 .cleanup-btn-merge { font-size: 13px; flex: 1; }
 
+/* ── Cleanup row wrapper (row + expandable tab list) ── */
+.cleanup-row-wrap { display: flex; flex-direction: column; }
+.cleanup-dup-row-wrap { display: flex; flex-direction: column; }
+
+/* Make tab count clickable */
+.cleanup-tabcount {
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  transition: color var(--transition);
+}
+.cleanup-tabcount:hover { color: var(--accent); }
+.cleanup-dup-row-info {
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.cleanup-dup-row-info:hover { color: var(--text-primary); }
+
+/* Expand chevron */
+.expand-chevron {
+  width: 12px; height: 12px;
+  flex-shrink: 0;
+  transition: transform 200ms cubic-bezier(0.4,0,0.2,1);
+  color: var(--text-muted);
+}
+.expand-chevron.open { transform: rotate(180deg); }
+
+/* Expandable tab list */
+.cleanup-tabs-list {
+  list-style: none;
+  margin: 0;
+  padding: 6px 14px 8px 44px;
+  background: rgba(0,0,0,0.18);
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cleanup-tabs-list.hidden { display: none !important; }
+
+.cleanup-tab-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  padding: 3px 0;
+  min-width: 0;
+}
+.cleanup-tab-favicon {
+  width: 14px; height: 14px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  object-fit: contain;
+}
+.cleanup-tab-favicon-placeholder {
+  width: 14px; height: 14px;
+  border-radius: 2px;
+  background: var(--bg-tertiary);
+  flex-shrink: 0;
+}
+.cleanup-tab-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.cleanup-tab-loading, .cleanup-tab-empty {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 4px 0;
+}
+
+/* ── Diagnostics ── */
+.diag-info { margin-bottom: 14px; }
+.diag-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.diag-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  width: 100px;
+}
+.diag-value {
+  font-size: 12px;
+  font-family: 'Cascadia Code', 'Consolas', monospace;
+  color: var(--accent);
+  background: var(--bg-tertiary);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  word-break: break-all;
+  user-select: all;
+}
+.diag-result {
+  margin-top: 12px;
+  padding: 14px 16px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  line-height: 1.65;
+}
+.diag-ok { color: #81c995; font-weight: 600; }
+.diag-err { color: #f28b82; font-weight: 600; }
+.diag-testing { color: var(--text-muted); font-style: italic; }
+.diag-detail { color: var(--text-secondary); margin-top: 6px; font-size: 12px; word-break: break-word; }
+.diag-hint { color: var(--text-muted); margin-top: 8px; font-size: 12px; }
+.diag-hint code { font-size: 11px; color: var(--accent); background: var(--bg-secondary); padding: 1px 5px; border-radius: 3px; }
+.diag-email { color: var(--text-muted); }
+.diag-list {
+  margin: 6px 0 0 16px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  list-style: disc;
+}
+
+.diag-steps-details { margin-top: 10px; }
+.diag-steps-summary {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+}
+.diag-steps-summary:hover { color: var(--text-secondary); }
+.diag-steps-summary::before { content: "▸"; font-size: 10px; }
+details[open] .diag-steps-summary::before { content: "▾"; }
+
 /* Inbox search */
 .inbox-search-wrap {
   position: relative;

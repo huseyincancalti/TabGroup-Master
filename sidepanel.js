@@ -36,6 +36,10 @@ chrome.runtime.onMessage.addListener(async (message) => {
   if (message.type === "STORE_UPDATED") {
     await loadData();
     render();
+  } else if (message.type === "RESTORED_FROM_CLOUD") {
+    await loadData();
+    render();
+    showToast(`♻️ Restored ${message.groupCount} groups from sync backup`, "info");
   }
 });
 
