@@ -1,7 +1,7 @@
 {
   "name": "com.tabgroup.master",
   "description": "TabGroup Master Native Host",
-  "path": "C:\\Users\\hsync\\Desktop\\Yazilim\\Eklenti\\Google Chrome\\TabGroup Master\\TabGroup-Master\\NativeHost\\importer.exe",
+  "path": "C:\\Users\\hsync\\Desktop\\Yazilim\\Eklenti\\Google Chrome\\TabGroup Master\\TabGroup-Master\\NativeHost\\run_host.bat",
   "type": "stdio",
   "allowed_origins": [
     "chrome-extension://jdkmjfpnajeaiojbmagembcihnjckooh/"

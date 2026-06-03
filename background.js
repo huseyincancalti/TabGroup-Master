@@ -1,37 +1,22 @@
-// ─── TabGroup Master — Service Worker ───────────────────────────────────────
+const STORE_KEYS = ["savedGroups", "folders"];
+const RECONCILE_DEBOUNCE_MS = 150;
+const NATIVE_HOST_NAME = "com.tabgroup.master";
+const IMPORT_TIMEOUT_MS = 90_000;
 
 chrome.action.onClicked.addListener(async (tab) => {
   await chrome.sidePanel.open({ windowId: tab.windowId });
 });
 
-// ─── Storage Helpers ─────────────────────────────────────────────────────────
-
-async function getStore() {
-  const data = await chrome.storage.local.get([
-    "savedGroups", "folders", "categories", "conflicts", "importMode",
-  ]);
-  const savedGroups = (data.savedGroups || []).map(normalizeGroup);
-  if (data.categories && data.categories.length) {
-    await chrome.storage.local.remove("categories");
-  }
-  return {
-    savedGroups,
-    folders: data.folders || [],
-    conflicts: data.conflicts || [],
-    importMode: data.importMode || false,
-  };
-}
-
-async function setStore(partial) {
-  await chrome.storage.local.set(partial);
-}
-
 function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 }
 
-function normalizeTitle(str) {
-  return String(str || "")
+function broadcast(payload) {
+  chrome.runtime.sendMessage(payload).catch(() => {});
+}
+
+function normalizeTitle(value) {
+  return String(value || "")
     .replace(/İ/g, "i").replace(/I/g, "i").replace(/ı/g, "i")
     .replace(/Ğ/g, "g").replace(/ğ/g, "g")
     .replace(/Ü/g, "u").replace(/ü/g, "u")
@@ -42,363 +27,347 @@ function normalizeTitle(str) {
     .toLowerCase();
 }
 
-function normalizeGroup(sg) {
+function normalizeGroup(group) {
+  const tabs = Array.isArray(group.tabs) ? group.tabs : [];
   return {
-    ...sg,
-    folderId: sg.folderId ?? null,
+    uid: group.uid || uid(),
+    title: group.title || "",
+    color: group.color || "grey",
+    tabs,
+    tabCount: typeof group.tabCount === "number" ? group.tabCount : tabs.length,
+    tabsLoaded: group.tabsLoaded ?? tabs.length > 0,
+    active: group.active === true,
+    chromeGroupId: group.chromeGroupId ?? null,
+    folderId: group.folderId ?? null,
+    savedAt: group.savedAt || Date.now(),
+  };
+}
+
+function normalizeFolder(folder) {
+  return {
+    id: folder.id || "f_" + uid(),
+    name: (folder.name || "New Folder").trim(),
+    parentId: folder.parentId ?? null,
+    isExpanded: folder.isExpanded !== false,
+  };
+}
+
+async function getStore() {
+  const data = await chrome.storage.local.get(STORE_KEYS);
+  return {
+    savedGroups: (data.savedGroups || []).map(normalizeGroup),
+    folders: (data.folders || []).map(normalizeFolder),
+  };
+}
+
+async function setStore(partial) {
+  await chrome.storage.local.set(partial);
+}
+
+function buildIndexes(store) {
+  return {
+    groupsByUid: new Map(store.savedGroups.map((g) => [g.uid, g])),
+    groupsByChromeId: new Map(
+      store.savedGroups
+        .filter((g) => g.chromeGroupId != null)
+        .map((g) => [g.chromeGroupId, g])
+    ),
+    foldersById: new Map(store.folders.map((f) => [f.id, f])),
   };
 }
 
 async function readLiveTabs(chromeGroupId) {
   const tabs = await chrome.tabs.query({ groupId: chromeGroupId });
   return tabs.map((t) => ({
-    id: t.id,
-    url: t.url || "",
+    url: t.url || t.pendingUrl || "",
     title: t.title || "",
     favIconUrl: t.favIconUrl || "",
   }));
 }
 
 async function snapshotLiveGroups() {
-  const chromeGroups = await chrome.tabGroups.query({});
+  const groups = await chrome.tabGroups.query({});
   const snapshots = [];
-  for (const g of chromeGroups) {
-    const tabs = await readLiveTabs(g.id);
+  for (const g of groups) {
+    const tabs = await chrome.tabs.query({ groupId: g.id });
     snapshots.push({
       chromeGroupId: g.id,
       title: g.title || "",
       color: g.color || "grey",
-      tabs,
+      tabCount: tabs.length,
     });
   }
   return snapshots;
 }
 
-// ─── Sync Logic ──────────────────────────────────────────────────────────────
+let reconciling = false;
+let reconcilePending = false;
+let reconcileTimer = null;
 
-let syncing = false;
-let syncPending = false;
-
-// ─── Scan Mutex ───────────────────────────────────────────────────────────────
-// When a native macro is running, suppress tab-event storms.  Any events that
-// arrive while isScanning is true are coalesced into a single final reconcile
-// that runs once the lock is released.
-
-let isScanning = false;
-let scanTimeoutId = null;
-const SCAN_LOCK_MAX_MS = 10_000;
-
-function acquireScanLock() {
-  isScanning = true;
-  clearTimeout(scanTimeoutId);
-  scanTimeoutId = setTimeout(() => releaseScanLock(true), SCAN_LOCK_MAX_MS);
+function scheduleReconcile() {
+  clearTimeout(reconcileTimer);
+  reconcileTimer = setTimeout(() => reconcile(), RECONCILE_DEBOUNCE_MS);
 }
 
-function releaseScanLock(runFinalSync = false) {
-  isScanning = false;
-  clearTimeout(scanTimeoutId);
-  if (runFinalSync) syncGroups();
-}
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function syncGroups() {
-  if (syncing) {
-    syncPending = true;
+async function reconcile() {
+  if (reconciling) {
+    reconcilePending = true;
     return;
   }
-  syncing = true;
+  reconciling = true;
   try {
-    await syncGroupsInner();
+    await reconcileInner();
   } finally {
-    syncing = false;
-    if (syncPending) {
-      syncPending = false;
-      syncGroups();
+    reconciling = false;
+    if (reconcilePending) {
+      reconcilePending = false;
+      reconcile();
     }
   }
 }
 
-function findByTitle(savedGroups, title, { inactiveOnly = false } = {}) {
-  const norm = normalizeTitle(title);
-  if (!norm) return -1;
-  return savedGroups.findIndex((sg) => {
-    if (inactiveOnly && sg.active) return false;
-    return normalizeTitle(sg.title) === norm;
-  });
+function makeCapturedGroup(snapshot, active) {
+  return {
+    uid: uid(),
+    title: snapshot.title,
+    color: snapshot.color,
+    tabs: snapshot.tabs || [],
+    tabCount: snapshot.tabCount,
+    tabsLoaded: Array.isArray(snapshot.tabs),
+    active,
+    chromeGroupId: active ? snapshot.chromeGroupId ?? null : null,
+    folderId: null,
+    savedAt: Date.now(),
+  };
 }
 
-async function syncGroupsInner() {
+async function reconcileInner() {
   const store = await getStore();
-  const liveGroupsSnapshot = await snapshotLiveGroups();
-  const liveIds = new Set(liveGroupsSnapshot.map((g) => g.chromeGroupId));
+  const live = await snapshotLiveGroups();
+  const liveIds = new Set(live.map((g) => g.chromeGroupId));
+  const groups = store.savedGroups;
 
-  let { savedGroups, conflicts, importMode } = store;
-
-  savedGroups = savedGroups.map((sg) => {
-    if (sg.active && !liveIds.has(sg.chromeGroupId)) {
-      return { ...sg, active: false, chromeGroupId: null };
-    }
-    return sg;
-  });
-
-  for (const liveGroup of liveGroupsSnapshot) {
-    let existingIdx = savedGroups.findIndex(
-      (sg) => sg.chromeGroupId === liveGroup.chromeGroupId
-    );
-
-    if (existingIdx === -1 && liveGroup.title) {
-      existingIdx = findByTitle(savedGroups, liveGroup.title, { inactiveOnly: true });
-      if (existingIdx === -1) {
-        existingIdx = findByTitle(savedGroups, liveGroup.title);
-      }
-    }
-
-    if (existingIdx !== -1) {
-      const prev = savedGroups[existingIdx];
-      savedGroups[existingIdx] = {
-        ...prev,
-        title: liveGroup.title,
-        color: liveGroup.color,
-        tabs: liveGroup.tabs,
-        active: true,
-        chromeGroupId: liveGroup.chromeGroupId,
-        folderId: prev.folderId ?? null,
-      };
-    } else {
-      if (importMode && liveGroup.title) {
-        const matchIdx = savedGroups.findIndex(
-          (sg) => normalizeTitle(sg.title) === normalizeTitle(liveGroup.title)
-        );
-        if (matchIdx !== -1) {
-          const match = savedGroups[matchIdx];
-          const alreadyConflict = conflicts.some(
-            (c) => !c.resolved && c.savedGroupUid === match.uid &&
-              c.incomingGroup?.chromeGroupId === liveGroup.chromeGroupId
-          );
-          if (!alreadyConflict) {
-            conflicts.push({
-              uid: uid(),
-              savedGroupUid: match.uid,
-              incomingGroup: { ...liveGroup },
-              resolved: false,
-            });
-          }
-          continue;
-        }
-      }
-
-      savedGroups.push({
-        uid: uid(),
-        title: liveGroup.title,
-        color: liveGroup.color,
-        tabs: liveGroup.tabs,
-        active: true,
-        chromeGroupId: liveGroup.chromeGroupId,
-        folderId: null,
-      });
+  for (const g of groups) {
+    if (g.active && !liveIds.has(g.chromeGroupId)) {
+      g.active = false;
+      g.chromeGroupId = null;
     }
   }
 
-  await setStore({ savedGroups, conflicts });
+  const byChromeId = new Map();
+  const byTitle = new Map();
+  for (const g of groups) {
+    if (g.chromeGroupId != null) byChromeId.set(g.chromeGroupId, g);
+    const key = normalizeTitle(g.title);
+    if (key) {
+      if (!byTitle.has(key)) byTitle.set(key, []);
+      byTitle.get(key).push(g);
+    }
+  }
+
+  const claimed = new Set();
+  for (const lg of live) {
+    let match = byChromeId.get(lg.chromeGroupId);
+    if (!match) {
+      const candidates = byTitle.get(normalizeTitle(lg.title)) || [];
+      match =
+        candidates.find((g) => !claimed.has(g.uid) && !g.active) ||
+        candidates.find((g) => !claimed.has(g.uid));
+    }
+    if (match) {
+      claimed.add(match.uid);
+      match.title = lg.title;
+      match.color = lg.color;
+      match.active = true;
+      match.chromeGroupId = lg.chromeGroupId;
+      match.tabCount = lg.tabCount;
+    } else {
+      groups.push(makeCapturedGroup({ ...lg, tabs: undefined }, true));
+    }
+  }
+
+  await setStore({ savedGroups: groups });
   broadcast({ type: "STORE_UPDATED" });
 }
 
-// ─── Listeners ───────────────────────────────────────────────────────────────
+function importFromChrome() {
+  return new Promise((resolve) => {
+    let port;
+    try {
+      port = chrome.runtime.connectNative(NATIVE_HOST_NAME);
+    } catch (e) {
+      resolve({ ok: false, error: "Native host not found. Run NativeHost/install.bat, then restart Chrome." });
+      return;
+    }
+    if (!port) {
+      resolve({ ok: false, error: "Native host not found. Run NativeHost/install.bat, then restart Chrome." });
+      return;
+    }
 
-// All tab/group change listeners are gated by the scan mutex so that a native
-// macro running in the background does not trigger hundreds of redundant syncs.
-function guardedSync() { if (!isScanning) syncGroups(); }
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { port.disconnect(); } catch (_) {}
+      resolve(result);
+    };
 
-chrome.tabGroups.onCreated.addListener(guardedSync);
-chrome.tabGroups.onUpdated.addListener(guardedSync);
-chrome.tabGroups.onRemoved.addListener(guardedSync);
+    port.onDisconnect.addListener(() => {
+      const err = chrome.runtime.lastError?.message;
+      finish({ ok: false, error: err || "Native host disconnected. Run install.bat and restart Chrome." });
+    });
+
+    port.onMessage.addListener(async (msg) => {
+      if (msg?.action !== "extractResult") return;
+      if (!msg.ok) {
+        finish({ ok: false, error: msg.error || "Extraction failed" });
+        return;
+      }
+      const res = await importStore(msg.data);
+      finish({ ok: true, added: res.added, total: (msg.data?.savedGroups || []).length });
+    });
+
+    const timer = setTimeout(
+      () => finish({ ok: false, error: "Timed out waiting for native host" }),
+      IMPORT_TIMEOUT_MS
+    );
+    port.postMessage({ action: "extract" });
+  });
+}
+
+async function importStore(data) {
+  if (!data || typeof data !== "object") return { added: 0 };
+  const store = await getStore();
+  const incomingFolders = Array.isArray(data.folders) ? data.folders : [];
+  const incomingGroups = Array.isArray(data.savedGroups) ? data.savedGroups : [];
+
+  const folderIds = new Set(store.folders.map((f) => f.id));
+  for (const folder of incomingFolders) {
+    if (folder?.id && !folderIds.has(folder.id)) {
+      store.folders.push(normalizeFolder(folder));
+      folderIds.add(folder.id);
+    }
+  }
+
+  const dedupKey = (g) => normalizeTitle(g?.title) || (g?.tabs?.[0]?.url || "");
+  const seen = new Set(store.savedGroups.map(dedupKey));
+  let added = 0;
+  for (const group of incomingGroups) {
+    const key = dedupKey(group);
+    if (key && seen.has(key)) continue;
+    store.savedGroups.push(normalizeGroup({ ...group, uid: uid(), active: false, chromeGroupId: null }));
+    if (key) seen.add(key);
+    added++;
+  }
+
+  await setStore({ savedGroups: store.savedGroups, folders: store.folders });
+  broadcast({ type: "STORE_UPDATED" });
+  return { added };
+}
+
+chrome.tabGroups.onCreated.addListener(scheduleReconcile);
+chrome.tabGroups.onUpdated.addListener(scheduleReconcile);
+chrome.tabGroups.onRemoved.addListener(scheduleReconcile);
+chrome.tabs.onRemoved.addListener(scheduleReconcile);
+chrome.tabs.onCreated.addListener(scheduleReconcile);
 chrome.tabs.onUpdated.addListener((_id, info) => {
-  if (!isScanning && (info.groupId !== undefined || info.title || info.url)) syncGroups();
+  if (info.groupId !== undefined || info.title || info.url) scheduleReconcile();
 });
-chrome.tabs.onRemoved.addListener(guardedSync);
-chrome.tabs.onCreated.addListener(guardedSync);
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  const h = handlers[msg.action];
-  if (h) {
-    h(msg).then(sendResponse).catch((e) => sendResponse({ error: e.message }));
-    return true;
-  }
+  const handler = handlers[msg.action];
+  if (!handler) return;
+  handler(msg).then(sendResponse).catch((e) => sendResponse({ error: e.message }));
+  return true;
 });
 
 const handlers = {
-  async getStore() { return getStore(); },
-
-  async setImportMode({ value }) {
-    await setStore({ importMode: value });
-    if (value) await syncGroups();
-    return { ok: true };
+  async getStore() {
+    return getStore();
   },
 
-  async warmupNativeHost() {
-    return new Promise((resolve) => {
-      chrome.runtime.sendNativeMessage(
-        "com.tabgroup.master",
-        { command: "PING" },
-        () => {
-          resolve({
-            ok: !chrome.runtime.lastError,
-            error: chrome.runtime.lastError?.message || null,
-          });
-        }
-      );
-    });
+  async importFromChrome() {
+    return importFromChrome();
   },
 
-  async syncGroupsNow() {
-    // Called by wizard after macro finishes — release the scan lock first so
-    // syncGroups() is allowed to run, then broadcast the result.
-    releaseScanLock(false);
-    await syncGroups();
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true };
-  },
-
-  async runNativeMacro() {
-    // Acquire the scan lock before firing the macro so incoming tab-change
-    // events during execution are suppressed.
-    acquireScanLock();
-    return new Promise((resolve) => {
-      chrome.runtime.sendNativeMessage(
-        "com.tabgroup.master",
-        { command: "START_MACRO" },
-        (response) => {
-          if (chrome.runtime.lastError) {
-            // On error release immediately and let a sync run.
-            releaseScanLock(true);
-            resolve({ ok: false, error: chrome.runtime.lastError.message });
-          } else {
-            // Lock stays active; syncGroupsNow will release it.
-            resolve({ ok: true, response });
-          }
-        }
-      );
-    });
+  async loadGroupTabs({ groupUid }) {
+    const store = await getStore();
+    const group = buildIndexes(store).groupsByUid.get(groupUid);
+    if (!group) return { ok: false };
+    if (group.active && group.chromeGroupId != null) {
+      const tabs = await readLiveTabs(group.chromeGroupId);
+      group.tabs = tabs;
+      group.tabCount = tabs.length;
+      group.tabsLoaded = true;
+      await setStore({ savedGroups: store.savedGroups });
+      return { ok: true, tabs };
+    }
+    return { ok: true, tabs: group.tabs || [] };
   },
 
   async restoreGroup({ groupUid }) {
     const store = await getStore();
-    const sg = store.savedGroups.find((g) => g.uid === groupUid);
-    if (!sg || sg.active) return { ok: false };
+    const group = buildIndexes(store).groupsByUid.get(groupUid);
+    if (!group || group.active) return { ok: false };
+    if (!group.tabs?.length) return { ok: false, error: "No tabs stored for this group" };
 
     const window = await chrome.windows.getCurrent();
     const tabIds = [];
-    for (const t of sg.tabs) {
-      if (!t.url || t.url.startsWith("chrome://")) continue;
-      const tab = await chrome.tabs.create({ url: t.url, windowId: window.id, active: false });
-      tabIds.push(tab.id);
+    for (const tab of group.tabs) {
+      if (!tab.url || tab.url.startsWith("chrome://")) continue;
+      const created = await chrome.tabs.create({ url: tab.url, windowId: window.id, active: false });
+      tabIds.push(created.id);
     }
-    if (tabIds.length === 0) return { ok: false };
+    if (tabIds.length === 0) return { ok: false, error: "No restorable tabs" };
 
     const chromeGroupId = await chrome.tabs.group({ tabIds, createProperties: { windowId: window.id } });
-    await chrome.tabGroups.update(chromeGroupId, { title: sg.title, color: sg.color });
+    await chrome.tabGroups.update(chromeGroupId, { title: group.title, color: group.color });
 
-    const idx = store.savedGroups.findIndex((g) => g.uid === groupUid);
-    store.savedGroups[idx].active = true;
-    store.savedGroups[idx].chromeGroupId = chromeGroupId;
+    group.active = true;
+    group.chromeGroupId = chromeGroupId;
     await setStore({ savedGroups: store.savedGroups });
-    await syncGroups();
+    await reconcile();
     return { ok: true };
   },
 
   async deleteGroup({ groupUid }) {
     const store = await getStore();
-    store.savedGroups = store.savedGroups.filter((g) => g.uid !== groupUid);
-    store.conflicts = store.conflicts.filter((c) => c.savedGroupUid !== groupUid);
-    await setStore({ savedGroups: store.savedGroups, conflicts: store.conflicts });
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true };
-  },
-
-  async removeGroupFromFolder({ groupUid }) {
-    const store = await getStore();
-    const sg = store.savedGroups.find((g) => g.uid === groupUid);
-    if (!sg) return { ok: false };
-    sg.folderId = null;
-    await setStore({ savedGroups: store.savedGroups });
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true };
-  },
-
-  async mergeConflict({ conflictUid }) {
-    const store = await getStore();
-    const conflict = store.conflicts.find((c) => c.uid === conflictUid);
-    if (!conflict) return { ok: false };
-
-    const savedIdx = store.savedGroups.findIndex((g) => g.uid === conflict.savedGroupUid);
-    if (savedIdx === -1) return { ok: false };
-
-    const existing = store.savedGroups[savedIdx];
-    const incoming = conflict.incomingGroup;
-
-    const seen = new Set(existing.tabs.map((t) => t.url));
-    const merged = [...existing.tabs];
-    for (const t of incoming.tabs) {
-      if (t.url && !seen.has(t.url)) {
-        seen.add(t.url);
-        merged.push(t);
-      }
-    }
-
-    store.savedGroups[savedIdx].tabs = merged;
-    store.conflicts = store.conflicts.map((c) =>
-      c.uid === conflictUid ? { ...c, resolved: true } : c
-    );
-
-    await setStore({ savedGroups: store.savedGroups, conflicts: store.conflicts });
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true };
-  },
-
-  async dismissConflict({ conflictUid }) {
-    const store = await getStore();
-    store.conflicts = store.conflicts.map((c) =>
-      c.uid === conflictUid ? { ...c, resolved: true } : c
-    );
-    await setStore({ conflicts: store.conflicts });
+    const savedGroups = store.savedGroups.filter((g) => g.uid !== groupUid);
+    await setStore({ savedGroups });
     broadcast({ type: "STORE_UPDATED" });
     return { ok: true };
   },
 
   async updateGroupTitle({ groupUid, title }) {
     const store = await getStore();
-    const sg = store.savedGroups.find((g) => g.uid === groupUid);
-    if (sg) {
-      sg.title = title;
-      if (sg.active && sg.chromeGroupId) {
-        await chrome.tabGroups.update(sg.chromeGroupId, { title });
-      }
-      await setStore({ savedGroups: store.savedGroups });
+    const group = buildIndexes(store).groupsByUid.get(groupUid);
+    if (!group) return { ok: false };
+    group.title = title;
+    if (group.active && group.chromeGroupId != null) {
+      await chrome.tabGroups.update(group.chromeGroupId, { title }).catch(() => {});
     }
+    await setStore({ savedGroups: store.savedGroups });
+    broadcast({ type: "STORE_UPDATED" });
     return { ok: true };
   },
 
   async updateGroupColor({ groupUid, color }) {
     const store = await getStore();
-    const sg = store.savedGroups.find((g) => g.uid === groupUid);
-    if (sg) {
-      sg.color = color;
-      if (sg.active && sg.chromeGroupId) {
-        await chrome.tabGroups.update(sg.chromeGroupId, { color });
-      }
-      await setStore({ savedGroups: store.savedGroups });
+    const group = buildIndexes(store).groupsByUid.get(groupUid);
+    if (!group) return { ok: false };
+    group.color = color;
+    if (group.active && group.chromeGroupId != null) {
+      await chrome.tabGroups.update(group.chromeGroupId, { color }).catch(() => {});
     }
+    await setStore({ savedGroups: store.savedGroups });
+    broadcast({ type: "STORE_UPDATED" });
     return { ok: true };
   },
 
   async createFolder({ name, parentId }) {
     const store = await getStore();
-    const folder = {
-      id: "f_" + uid(),
-      name: (name || "New Folder").trim(),
-      parentId: parentId || null,
-      isExpanded: true,
-    };
+    const folder = normalizeFolder({ name, parentId: parentId || null });
     store.folders.push(folder);
     await setStore({ folders: store.folders });
     broadcast({ type: "STORE_UPDATED" });
@@ -407,7 +376,7 @@ const handlers = {
 
   async renameFolder({ folderId, name }) {
     const store = await getStore();
-    const folder = store.folders.find((f) => f.id === folderId);
+    const folder = buildIndexes(store).foldersById.get(folderId);
     if (!folder) return { ok: false };
     folder.name = (name || folder.name).trim();
     await setStore({ folders: store.folders });
@@ -417,25 +386,21 @@ const handlers = {
 
   async deleteFolder({ folderId }) {
     const store = await getStore();
-    const target = store.folders.find((f) => f.id === folderId);
-    if (!target) return { ok: false };
-
-    store.savedGroups = store.savedGroups.map((g) =>
+    if (!buildIndexes(store).foldersById.get(folderId)) return { ok: false };
+    const savedGroups = store.savedGroups.map((g) =>
       g.folderId === folderId ? { ...g, folderId: null } : g
     );
-
-    store.folders = store.folders
+    const folders = store.folders
       .filter((f) => f.id !== folderId)
       .map((f) => (f.parentId === folderId ? { ...f, parentId: null } : f));
-
-    await setStore({ folders: store.folders, savedGroups: store.savedGroups });
+    await setStore({ folders, savedGroups });
     broadcast({ type: "STORE_UPDATED" });
     return { ok: true };
   },
 
   async setFolderExpanded({ folderId, isExpanded }) {
     const store = await getStore();
-    const folder = store.folders.find((f) => f.id === folderId);
+    const folder = buildIndexes(store).foldersById.get(folderId);
     if (!folder) return { ok: false };
     folder.isExpanded = !!isExpanded;
     await setStore({ folders: store.folders });
@@ -444,24 +409,21 @@ const handlers = {
 
   async moveItem({ itemType, itemId, targetFolderId }) {
     const store = await getStore();
+    const indexes = buildIndexes(store);
     const newParent = targetFolderId || null;
 
     if (itemType === "folder") {
-      const folder = store.folders.find((f) => f.id === itemId);
-      if (!folder) return { ok: false };
-      if (newParent === folder.id) return { ok: false };
-
+      const folder = indexes.foldersById.get(itemId);
+      if (!folder || newParent === folder.id) return { ok: false };
       let ancestor = newParent;
       while (ancestor) {
         if (ancestor === folder.id) return { ok: false };
-        const a = store.folders.find((f) => f.id === ancestor);
-        ancestor = a ? a.parentId : null;
+        ancestor = indexes.foldersById.get(ancestor)?.parentId ?? null;
       }
-
       folder.parentId = newParent;
       await setStore({ folders: store.folders });
     } else if (itemType === "group") {
-      const group = store.savedGroups.find((g) => g.uid === itemId);
+      const group = indexes.groupsByUid.get(itemId);
       if (!group) return { ok: false };
       group.folderId = newParent;
       await setStore({ savedGroups: store.savedGroups });
@@ -472,10 +434,53 @@ const handlers = {
     broadcast({ type: "STORE_UPDATED" });
     return { ok: true };
   },
+
+  async removeGroupFromFolder({ groupUid }) {
+    const store = await getStore();
+    const group = buildIndexes(store).groupsByUid.get(groupUid);
+    if (!group) return { ok: false };
+    group.folderId = null;
+    await setStore({ savedGroups: store.savedGroups });
+    broadcast({ type: "STORE_UPDATED" });
+    return { ok: true };
+  },
+
+  async mergeGroups({ keepUid, mergeUid }) {
+    const store = await getStore();
+    const idx = buildIndexes(store);
+    const keep = idx.groupsByUid.get(keepUid);
+    const merge = idx.groupsByUid.get(mergeUid);
+    if (!keep || !merge) return { ok: false };
+    const seen = new Set((keep.tabs || []).map((t) => t.url).filter(Boolean));
+    for (const tab of (merge.tabs || [])) {
+      if (tab.url && !seen.has(tab.url)) {
+        keep.tabs.push(tab);
+        seen.add(tab.url);
+      }
+    }
+    keep.tabCount = keep.tabs.length;
+    keep.tabsLoaded = true;
+    store.savedGroups = store.savedGroups.filter((g) => g.uid !== mergeUid);
+    await setStore({ savedGroups: store.savedGroups });
+    broadcast({ type: "STORE_UPDATED" });
+    return { ok: true };
+  },
+
+  async deleteMultipleGroups({ groupUids }) {
+    if (!Array.isArray(groupUids) || !groupUids.length) return { ok: false };
+    const toDelete = new Set(groupUids);
+    const store = await getStore();
+    const savedGroups = store.savedGroups.filter((g) => !toDelete.has(g.uid));
+    await setStore({ savedGroups });
+    broadcast({ type: "STORE_UPDATED" });
+    return { ok: true, deleted: groupUids.length };
+  },
+
+  async importJson({ data }) {
+    if (!data || typeof data !== "object") return { ok: false, error: "Invalid backup file" };
+    const res = await importStore(data);
+    return { ok: true, added: res.added };
+  },
 };
 
-function broadcast(payload) {
-  chrome.runtime.sendMessage(payload).catch(() => {});
-}
-
-syncGroups();
+reconcile();

@@ -1,5 +1,3 @@
-// ─── TabGroup Master — Side Panel Script ───
-
 const CHROME_COLORS = [
   "grey", "blue", "red", "yellow", "green",
   "pink", "purple", "cyan", "orange",
@@ -10,87 +8,68 @@ const COLOR_HEX = {
   green: "#81c995", pink: "#f48fb1", purple: "#d7aefb", cyan: "#78d9ec", orange: "#fcad70",
 };
 
-let state = {
+const state = {
   savedGroups: [],
   folders: [],
-  conflicts: [],
-  importMode: false,
   searchQuery: "",
   editingGroupUid: null,
   activeTab: "active",
-  // Normalized O(1) indexes rebuilt after every loadData()
-  groupIndex: new Map(),   // uid -> group
-  conflictIndex: new Map(), // uid -> conflict
+  groupIndex: new Map(),
 };
 
 document.addEventListener("DOMContentLoaded", async () => {
   await loadData();
   bindStaticListeners();
-  MacroWizard.init({
-    showToast,
-    onImportModeEnabled: async () => {
-      state.importMode = true;
-      updateImportToggle();
-    },
-    onComplete: async () => {
-      await loadData();
-      render();
-    },
-  });
   render();
 });
 
 chrome.storage.onChanged.addListener(async (changes, area) => {
   if (area !== "local") return;
-  if (changes.savedGroups || changes.folders || changes.conflicts || changes.importMode) {
+  if (changes.savedGroups || changes.folders) {
     await loadData();
     render();
   }
 });
 
 chrome.runtime.onMessage.addListener(async (message) => {
-  if (!message || message.type !== "STORE_UPDATED") return;
-  await loadData();
-  render();
+  if (!message) return;
+  if (message.type === "STORE_UPDATED") {
+    await loadData();
+    render();
+  }
 });
+
+function sendMsg(message) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(message, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve(null);
+        return;
+      }
+      resolve(response);
+    });
+  });
+}
 
 async function loadData() {
   const store = await sendMsg({ action: "getStore" });
   if (!store) return;
   state.savedGroups = store.savedGroups || [];
   state.folders = store.folders || [];
-  state.conflicts = store.conflicts || [];
-  state.importMode = store.importMode || false;
   buildIndexes();
 }
 
-// Build O(1) lookup Maps from flat arrays. Call after every state mutation.
 function buildIndexes() {
   state.groupIndex = new Map(state.savedGroups.map((g) => [g.uid, g]));
-  state.conflictIndex = new Map(state.conflicts.map((c) => [c.uid, c]));
 }
 
-function sendMsg(message) {
-  return new Promise((resolve) => {
-    chrome.runtime.sendMessage(message, (response) => {
-      if (chrome.runtime.lastError) { resolve(null); return; }
-      resolve(response);
-    });
-  });
+function getGroupTabCount(group) {
+  if (typeof group.tabCount === "number") return group.tabCount;
+  return (group.tabs || []).length;
 }
 
-function switchTab(tabName) {
-  state.activeTab = tabName;
-  document.querySelectorAll(".tab-btn").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.tab === tabName);
-  });
-  document.querySelectorAll(".pane").forEach((pane) => pane.classList.add("hidden"));
-  const pane = document.getElementById(`pane-${tabName}`);
-  if (pane) pane.classList.remove("hidden");
-}
-
-function normalizeText(str) {
-  return String(str)
+function normalizeText(value) {
+  return String(value)
     .replace(/İ/g, "i").replace(/I/g, "i").replace(/ı/g, "i")
     .replace(/Ğ/g, "g").replace(/ğ/g, "g")
     .replace(/Ü/g, "u").replace(/ü/g, "u")
@@ -108,31 +87,88 @@ function titleMatchesSearch(title, query) {
 function highlightTitle(title, query) {
   const raw = title || "Unnamed Group";
   if (!query) return escHtml(raw);
-  const normTitle = normalizeText(raw);
-  const normQuery = normalizeText(query);
-  const idx = normTitle.indexOf(normQuery);
+  const idx = normalizeText(raw).indexOf(normalizeText(query));
   if (idx === -1) return escHtml(raw);
-  const origMatch = raw.substring(idx, idx + query.length);
   return escHtml(raw.substring(0, idx)) +
-    `<span class="search-highlight">${escHtml(origMatch)}</span>` +
+    `<span class="search-highlight">${escHtml(raw.substring(idx, idx + query.length))}</span>` +
     escHtml(raw.substring(idx + query.length));
 }
 
-function conflictMatchesSearch(conflict, query) {
-  if (!query) return true;
-  // O(1) Map lookup instead of O(N) array scan
-  const saved = state.groupIndex.get(conflict.savedGroupUid);
-  const incomingTitle = conflict.incomingGroup?.title || "";
-  const savedTitle = saved ? (saved.title || "") : "";
-  return titleMatchesSearch(incomingTitle, query) || titleMatchesSearch(savedTitle, query);
+function escHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function renderTabsList(listEl, tabs) {
+  listEl.innerHTML = "";
+  if (!tabs.length) {
+    listEl.innerHTML = "<li class=\"group-tab-empty\">No tabs</li>";
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  tabs.forEach((tab) => {
+    const li = document.createElement("li");
+    li.className = "group-tab-item";
+    li.textContent = tab.title || tab.url || "Untitled";
+    li.title = tab.url || "";
+    frag.appendChild(li);
+  });
+  listEl.appendChild(frag);
+}
+
+async function toggleGroupTabsList(card, group) {
+  let list = card.querySelector(".group-tabs-list");
+  if (list && !list.classList.contains("hidden")) {
+    list.classList.add("hidden");
+    return;
+  }
+  if (!list) {
+    list = document.createElement("ul");
+    list.className = "group-tabs-list";
+    card.appendChild(list);
+  }
+  list.classList.remove("hidden");
+  if (group.tabsLoaded && group.tabs?.length) {
+    renderTabsList(list, group.tabs);
+    return;
+  }
+  list.innerHTML = "<li class=\"group-tab-loading\">Loading…</li>";
+  const res = await sendMsg({ action: "loadGroupTabs", groupUid: group.uid });
+  if (!res?.ok) {
+    list.innerHTML = "<li class=\"group-tab-empty\">Could not load tabs</li>";
+    return;
+  }
+  group.tabs = res.tabs || [];
+  group.tabCount = group.tabs.length;
+  group.tabsLoaded = true;
+  renderTabsList(list, group.tabs);
+}
+
+function bindTabCountExpand(card, group) {
+  const countEl = card.querySelector(".group-tab-count");
+  if (!countEl) return;
+  countEl.classList.add("group-tab-count-expandable");
+  countEl.addEventListener("click", (e) => {
+    e.stopPropagation();
+    toggleGroupTabsList(card, group);
+  });
+}
+
+function switchTab(tabName) {
+  state.activeTab = tabName;
+  document.querySelectorAll(".tab-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.tab === tabName);
+  });
+  document.querySelectorAll(".pane").forEach((pane) => pane.classList.add("hidden"));
+  document.getElementById(`pane-${tabName}`)?.classList.remove("hidden");
 }
 
 function render() {
   renderActivePane();
   renderSavedPane();
-  renderConflictsPane();
-  updateImportToggle();
-  updateConflictBadge();
 }
 
 function renderActivePane() {
@@ -145,14 +181,13 @@ function renderActivePane() {
 
   document.getElementById("empty-active").classList.toggle("hidden", active.length > 0);
 
-  // Build off-DOM via DocumentFragment — single reflow on append
   const frag = document.createDocumentFragment();
   active.forEach((group, index) => {
     const card = document.createElement("div");
     card.className = "group-card animate-in";
     card.style.animationDelay = `${index * 40}ms`;
     card.innerHTML = buildGroupCardHTML(group);
-    bindGroupCardActions(card, group);
+    bindActiveCardActions(card, group);
     frag.appendChild(card);
   });
   container.innerHTML = "";
@@ -161,7 +196,7 @@ function renderActivePane() {
 
 function buildGroupCardHTML(group) {
   const title = highlightTitle(group.title, state.searchQuery);
-  const tabCount = (group.tabs || []).length;
+  const tabCount = getGroupTabCount(group);
   const dot = COLOR_HEX[group.color] || COLOR_HEX.grey;
   const inFolder = group.folderId ? `<span class="folder-tag" title="Organized in Workspace">📁</span>` : "";
   return `
@@ -194,24 +229,23 @@ function buildGroupCardHTML(group) {
     </div>`;
 }
 
-function bindGroupCardActions(card, group) {
+function bindActiveCardActions(card, group) {
+  bindTabCountExpand(card, group);
+
   card.querySelector(".edit-group-btn").addEventListener("click", (e) => {
     e.stopPropagation();
     openEditModal(group);
   });
 
-  card.querySelector(".delete-active-btn").addEventListener("click", async (e) => {
+  card.querySelector(".delete-active-btn").addEventListener("click", (e) => {
     e.stopPropagation();
     if (!confirm(`Delete "${group.title || "Unnamed Group"}" permanently?`)) return;
-    // Optimistic: remove card from DOM immediately (0 ms perceived latency)
-    const cardEl = e.currentTarget.closest(".group-card") || card;
-    cardEl.remove();
+    (e.currentTarget.closest(".group-card") || card).remove();
     state.savedGroups = state.savedGroups.filter((g) => g.uid !== group.uid);
     buildIndexes();
     document.getElementById("empty-active")?.classList.toggle("hidden", state.savedGroups.some((g) => g.active));
     showToast("Group deleted", "success");
-    // Async persistence — does not block UI
-    sendMsg({ action: "deleteGroup", groupUid: group.uid }).then(() => loadData().then(render));
+    sendMsg({ action: "deleteGroup", groupUid: group.uid });
   });
 
   card.querySelector(".toggle-group-btn").addEventListener("click", async (e) => {
@@ -227,13 +261,12 @@ function bindGroupCardActions(card, group) {
 
 function getInboxGroups() {
   return state.savedGroups
-    .filter((g) => !g.active && (g.folderId == null))
+    .filter((g) => !g.active && g.folderId == null)
     .filter((g) => titleMatchesSearch(g.title, state.searchQuery));
 }
 
 function updateSavedEmptyState() {
-  const empty = document.getElementById("empty-saved");
-  if (empty) empty.classList.toggle("hidden", getInboxGroups().length > 0);
+  document.getElementById("empty-saved")?.classList.toggle("hidden", getInboxGroups().length > 0);
 }
 
 function renderSavedPane() {
@@ -243,12 +276,11 @@ function renderSavedPane() {
   const inbox = getInboxGroups();
   updateSavedEmptyState();
 
-  // Build off-DOM via DocumentFragment — single reflow on append
   const frag = document.createDocumentFragment();
   inbox.forEach((group, index) => {
     const dot = COLOR_HEX[group.color] || COLOR_HEX.grey;
     const title = highlightTitle(group.title, state.searchQuery);
-    const tabCount = (group.tabs || []).length;
+    const tabCount = getGroupTabCount(group);
 
     const card = document.createElement("div");
     card.className = "group-card saved-group-card animate-in";
@@ -280,101 +312,25 @@ function renderSavedPane() {
     card.querySelector(".restore-btn").addEventListener("click", async () => {
       const res = await sendMsg({ action: "restoreGroup", groupUid: group.uid });
       if (res?.ok) showToast("Group restored", "success");
-      await loadData();
-      render();
+      else showToast(res?.error || "Could not restore group", "error");
     });
 
-    card.querySelector(".delete-btn").addEventListener("click", async (e) => {
+    card.querySelector(".delete-btn").addEventListener("click", (e) => {
       e.stopPropagation();
-      // Optimistic: remove from DOM and local state immediately
-      const cardEl = e.currentTarget.closest(".saved-group-card") || card;
-      cardEl.remove();
+      (e.currentTarget.closest(".saved-group-card") || card).remove();
       state.savedGroups = state.savedGroups.filter((g) => g.uid !== group.uid);
       buildIndexes();
       updateSavedEmptyState();
       showToast("Group deleted", "success");
-      // Async persistence
-      sendMsg({ action: "deleteGroup", groupUid: group.uid }).then(() => loadData().then(renderSavedPane));
+      sendMsg({ action: "deleteGroup", groupUid: group.uid });
     });
 
+    bindTabCountExpand(card, group);
     frag.appendChild(card);
   });
 
   container.innerHTML = "";
   container.appendChild(frag);
-}
-
-function renderConflictsPane() {
-  const container = document.getElementById("conflicts-list");
-  if (!container) return;
-  container.innerHTML = "";
-
-  const unresolved = state.conflicts
-    .filter((c) => !c.resolved)
-    .filter((c) => conflictMatchesSearch(c, state.searchQuery));
-
-  document.getElementById("empty-conflicts").classList.toggle("hidden", unresolved.length > 0);
-
-  unresolved.forEach((conflict, index) => {
-    // O(1) Map lookup
-    const saved = state.groupIndex.get(conflict.savedGroupUid);
-    const incoming = conflict.incomingGroup;
-    const dot = COLOR_HEX[incoming?.color] || COLOR_HEX.grey;
-    const inTitle = highlightTitle(incoming?.title, state.searchQuery);
-    const svTitle = highlightTitle(saved ? saved.title : "Deleted", state.searchQuery);
-    const inTabs = (incoming?.tabs || []).length;
-    const svTabs = saved ? (saved.tabs || []).length : 0;
-
-    const card = document.createElement("div");
-    card.className = "conflict-card animate-in";
-    card.style.animationDelay = `${index * 45}ms`;
-    card.innerHTML = `
-      <div class="conflict-header">
-        <span class="group-color-dot" style="background:${dot}"></span>
-        <div class="conflict-info">
-          <div class="conflict-title">Title conflict: <strong>${inTitle}</strong></div>
-          <div class="conflict-meta">
-            Incoming: ${inTabs} tab${inTabs !== 1 ? "s" : ""} &nbsp;|&nbsp;
-            Saved: ${svTitle} (${svTabs} tab${svTabs !== 1 ? "s" : ""})
-          </div>
-        </div>
-      </div>
-      <div class="conflict-actions">
-        <button class="merge-btn btn-primary" type="button">Merge</button>
-        <button class="dismiss-btn btn-secondary" type="button">Dismiss</button>
-      </div>`;
-
-    card.querySelector(".merge-btn").addEventListener("click", async () => {
-      await sendMsg({ action: "mergeConflict", conflictUid: conflict.uid });
-      await loadData();
-      render();
-      showToast("Groups merged", "success");
-    });
-
-    card.querySelector(".dismiss-btn").addEventListener("click", async () => {
-      await sendMsg({ action: "dismissConflict", conflictUid: conflict.uid });
-      await loadData();
-      render();
-    });
-
-    frag.appendChild(card);
-  });
-  container.innerHTML = "";
-  container.appendChild(frag);
-}
-
-function updateConflictBadge() {
-  const count = state.conflicts.filter((c) => !c.resolved).length;
-  const badge = document.getElementById("conflict-badge");
-  if (badge) {
-    badge.textContent = count;
-    badge.classList.toggle("hidden", count === 0);
-  }
-}
-
-function updateImportToggle() {
-  const toggle = document.getElementById("import-toggle");
-  if (toggle) toggle.checked = state.importMode;
 }
 
 function openEditModal(group) {
@@ -388,18 +344,18 @@ function openEditModal(group) {
 function buildColorPicker(selectedColor) {
   const picker = document.getElementById("edit-color-picker");
   picker.innerHTML = "";
-  CHROME_COLORS.forEach((c) => {
-    const sw = document.createElement("button");
-    sw.type = "button";
-    sw.className = "color-swatch" + (c === selectedColor ? " selected" : "");
-    sw.style.background = COLOR_HEX[c];
-    sw.dataset.color = c;
-    sw.title = c;
-    sw.addEventListener("click", () => {
+  CHROME_COLORS.forEach((color) => {
+    const swatch = document.createElement("button");
+    swatch.type = "button";
+    swatch.className = "color-swatch" + (color === selectedColor ? " selected" : "");
+    swatch.style.background = COLOR_HEX[color];
+    swatch.dataset.color = color;
+    swatch.title = color;
+    swatch.addEventListener("click", () => {
       picker.querySelectorAll(".color-swatch").forEach((s) => s.classList.remove("selected"));
-      sw.classList.add("selected");
+      swatch.classList.add("selected");
     });
-    picker.appendChild(sw);
+    picker.appendChild(swatch);
   });
 }
 
@@ -409,23 +365,76 @@ function closeEditModal() {
 }
 
 async function confirmEditGroup() {
-  const gUid = state.editingGroupUid;
-  if (!gUid) return;
+  const groupUid = state.editingGroupUid;
+  if (!groupUid) return;
   const title = document.getElementById("edit-group-title").value.trim();
   const selectedSwatch = document.querySelector("#edit-color-picker .color-swatch.selected");
   const color = selectedSwatch ? selectedSwatch.dataset.color : undefined;
   const ops = [];
-  if (title) ops.push(sendMsg({ action: "updateGroupTitle", groupUid: gUid, title }));
-  if (color) ops.push(sendMsg({ action: "updateGroupColor", groupUid: gUid, color }));
+  if (title) ops.push(sendMsg({ action: "updateGroupTitle", groupUid, title }));
+  if (color) ops.push(sendMsg({ action: "updateGroupColor", groupUid, color }));
   await Promise.all(ops);
   closeEditModal();
+}
+
+let _importing = false;
+
+async function runImport() {
+  if (_importing) return;
+  _importing = true;
+  document.getElementById("import-overlay")?.classList.remove("hidden");
+  try {
+    const res = await sendMsg({ action: "importFromChrome" });
+    if (res?.ok) {
+      await loadData();
+      render();
+      showToast(`Imported ${res.added} new group${res.added !== 1 ? "s" : ""} (${res.total} found)`, "success");
+    } else {
+      showToast(res?.error || "Import failed", "error");
+    }
+  } finally {
+    _importing = false;
+    document.getElementById("import-overlay")?.classList.add("hidden");
+  }
+}
+
+async function refreshWorkspace() {
   await loadData();
   render();
+  showToast("Workspace refreshed", "success");
+}
+
+function openResetWorkspaceModal() {
+  document.getElementById("sp-reset-overlay")?.classList.remove("hidden");
+}
+
+function closeResetWorkspaceModal() {
+  document.getElementById("sp-reset-overlay")?.classList.add("hidden");
+}
+
+async function confirmResetWorkspace() {
+  closeResetWorkspaceModal();
+  await chrome.storage.local.remove(["savedGroups", "folders"]);
+  state.savedGroups = [];
+  state.folders = [];
+  buildIndexes();
+  render();
+  showToast("Workspace reset", "success");
 }
 
 function bindStaticListeners() {
   document.getElementById("btn-open-dashboard")?.addEventListener("click", () => {
     chrome.tabs.create({ url: chrome.runtime.getURL("dashboard.html") });
+  });
+
+  document.getElementById("btn-import-chrome")?.addEventListener("click", runImport);
+
+  document.getElementById("btn-refresh-workspace")?.addEventListener("click", refreshWorkspace);
+  document.getElementById("btn-reset-workspace")?.addEventListener("click", openResetWorkspaceModal);
+  document.getElementById("sp-reset-cancel")?.addEventListener("click", closeResetWorkspaceModal);
+  document.getElementById("sp-reset-confirm")?.addEventListener("click", confirmResetWorkspace);
+  document.getElementById("sp-reset-overlay")?.addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) closeResetWorkspaceModal();
   });
 
   document.querySelectorAll(".tab-btn").forEach((btn) => {
@@ -434,18 +443,6 @@ function bindStaticListeners() {
 
   document.getElementById("search-input").addEventListener("input", (e) => {
     state.searchQuery = e.target.value.trim();
-    render();
-  });
-
-  document.querySelector(".info-tooltip")?.addEventListener("click", (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-  });
-
-  document.getElementById("import-toggle").addEventListener("change", async (e) => {
-    state.importMode = e.target.checked;
-    await sendMsg({ action: "setImportMode", value: state.importMode });
-    await loadData();
     render();
   });
 
@@ -459,6 +456,12 @@ function bindStaticListeners() {
     if (e.key === "Escape") closeEditModal();
   });
 
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (!document.getElementById("sp-reset-overlay")?.classList.contains("hidden")) {
+      closeResetWorkspaceModal();
+    }
+  });
 }
 
 function showToast(message, type = "info") {
@@ -475,12 +478,4 @@ function showToast(message, type = "info") {
     setTimeout(() => toast.remove(), 400);
   };
   setTimeout(dismiss, 3000);
-}
-
-function escHtml(str) {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
 }

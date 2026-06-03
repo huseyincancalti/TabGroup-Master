@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>TabGroup Master — Dashboard</title>
   <link rel="stylesheet" href="dashboard.css" />
-  <link rel="stylesheet" href="macro-wizard.css" />
 </head>
 <body>
 
@@ -32,6 +31,10 @@
         <button class="nav-btn" data-view="workspace">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
           Workspace
+        </button>
+        <button class="nav-btn" data-view="cleanup">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+          Cleanup
         </button>
         <button class="nav-btn" data-view="settings">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
@@ -62,21 +65,15 @@
           <article class="macro-setup-locked glass-panel">
             <div class="macro-setup-header">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
-              </svg>
-              <h3>1-Click Automation Setup</h3>
-            </div>
-            <ol class="setup-steps setup-steps-locked">
-              <li>Download the <code>NativeHost</code> folder from GitHub to your local computer.</li>
-              <li>Double-click and run the <code>install.bat</code> file inside the folder.</li>
-              <li>The system will automatically detect your PC paths, mask your local username for privacy, and securely register the Native Host within Chrome. No manual JSON editing required!</li>
-            </ol>
-            <button id="btn-run-macro" class="btn-primary btn-autoscan" type="button">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <polygon points="5 3 19 12 5 21 5 3"/>
               </svg>
-              Launch Auto-Scan
-            </button>
+              <h3>Import your saved groups — First Time Setup</h3>
+            </div>
+            <ol class="setup-steps">
+              <li>Run <code>NativeHost/install.bat</code> once (registers the helper and installs its one dependency).</li>
+              <li>Open the side panel and click <strong>Import from Chrome</strong>.</li>
+              <li>All your saved tab groups are read directly from Chrome's local data in a couple of seconds — no tabs opened, no clicking, nothing loaded into memory. Re-run anytime; only new groups are added.</li>
+            </ol>
           </article>
 
           <section class="overview-support glass-panel">
@@ -110,10 +107,18 @@
             <h2>Workspace</h2>
             <p>Organize your tab groups into nested folders. Drag &amp; drop freely.</p>
           </div>
-          <button id="btn-new-folder" class="btn-primary" type="button">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
-            New Folder
-          </button>
+          <div class="view-header-actions">
+            <button id="btn-refresh-workspace" class="header-glass-btn" type="button" title="Refresh" aria-label="Refresh">
+              <span aria-hidden="true">🔄</span>
+            </button>
+            <button id="btn-reset-workspace" class="header-glass-btn header-glass-btn-danger" type="button" title="Reset Everything" aria-label="Reset Everything">
+              <span aria-hidden="true">🗑️</span>
+            </button>
+            <button id="btn-new-folder" class="btn-primary" type="button">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
+              New Folder
+            </button>
+          </div>
         </header>
 
         <div class="workspace-layout">
@@ -122,9 +127,13 @@
               <h3>Inbox (Unassigned)</h3>
               <span id="inbox-count" class="panel-badge">0</span>
             </div>
-            <p class="inbox-hint">Drag groups into folders on the right to organize.</p>
+            <div class="inbox-search-wrap">
+              <svg class="inbox-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+              <input id="inbox-search" type="text" placeholder="Filter groups…" autocomplete="off" spellcheck="false" />
+            </div>
             <div id="dashboard-inbox-list" class="tree-list dashboard-inbox-list" data-folder-id="inbox"></div>
-            <p id="inbox-empty" class="panel-empty hidden">No unassigned groups. Remove groups from folders or close tab groups in Chrome.</p>
+            <button id="inbox-show-more" class="inbox-show-more hidden" type="button">Show more</button>
+            <p id="inbox-empty" class="panel-empty hidden">No unassigned groups.</p>
           </section>
 
           <section id="folders-tree" class="workspace-folders-panel glass-panel">
@@ -135,6 +144,41 @@
             <div id="folders-tree-container" class="tree-view tree-list" data-folder-id="root"></div>
             <p id="tree-empty" class="panel-empty hidden">No folders yet. Click <strong>New Folder</strong> to start organizing.</p>
           </section>
+        </div>
+      </section>
+
+      <!-- Cleanup -->
+      <section id="view-cleanup" class="dashboard-view">
+        <header class="view-header">
+          <div>
+            <h2>Cleanup</h2>
+            <p>Remove unnamed groups and merge duplicates before organizing.</p>
+          </div>
+        </header>
+
+        <div class="cleanup-layout">
+          <!-- Unnamed / Empty -->
+          <article class="cleanup-section glass-panel">
+            <div class="cleanup-section-head">
+              <h3>Unnamed &amp; Empty <span id="cleanup-unnamed-badge" class="panel-badge">0</span></h3>
+              <div class="cleanup-section-actions">
+                <button id="cleanup-select-all" class="btn-secondary" type="button">Select all</button>
+                <button id="cleanup-deselect-all" class="btn-secondary" type="button">Deselect</button>
+                <button id="cleanup-delete-selected" class="btn-danger" type="button">Delete selected</button>
+              </div>
+            </div>
+            <p class="cleanup-hint">Groups with no title, a 1-character title, or 0 tabs.</p>
+            <div id="cleanup-unnamed-list" class="cleanup-list"></div>
+          </article>
+
+          <!-- Duplicates -->
+          <article class="cleanup-section glass-panel">
+            <div class="cleanup-section-head">
+              <h3>Duplicate Names <span id="cleanup-duplicates-badge" class="panel-badge">0</span></h3>
+            </div>
+            <p class="cleanup-hint">Groups sharing the same title. Merge combines unique tabs from both; duplicate URLs are dropped.</p>
+            <div id="cleanup-duplicates-list" class="cleanup-list"></div>
+          </article>
         </div>
       </section>
 
@@ -150,11 +194,18 @@
         <div class="settings-content">
           <article class="settings-card glass-panel">
             <h3>Data Management</h3>
-            <p class="settings-desc">Export your tab groups and folder layout as a portable JSON backup.</p>
-            <button id="btn-export-json" class="btn-primary btn-export" type="button">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              Export to JSON
-            </button>
+            <p class="settings-desc">Export your tab groups and folder layout as a portable JSON backup, or import one back in.</p>
+            <div class="settings-actions">
+              <button id="btn-export-json" class="btn-primary btn-export" type="button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                Export to JSON
+              </button>
+              <button id="btn-import-json" class="btn-secondary btn-import" type="button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                Import JSON
+              </button>
+              <input type="file" id="import-file-input" accept="application/json,.json" hidden />
+            </div>
           </article>
 
           <article class="settings-card glass-panel">
@@ -185,27 +236,15 @@
     </div>
   </div>
 
-  <div id="autoscroll-wizard-modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="wizard-heading-step1">
-    <div class="autoscroll-wizard-card">
-      <div id="wizard-step-1" class="wizard-step">
-        <h2 id="wizard-heading-step1">🛠️ Native Host Setup Verification</h2>
-        <p>Before we map your workspace, have you executed the install.bat file inside your downloaded NativeHost folder?</p>
-        <div class="wizard-info-alert" role="note">
-          <span class="wizard-info-alert-label">💡 Note</span>
-          <p class="wizard-info-alert-text">If you have already executed it before and haven't moved or deleted the NativeHost folder, you don't need to run it again.</p>
-        </div>
-        <div class="wizard-actions">
-          <button id="wizard-verify-no" class="wizard-btn wizard-btn-muted" type="button">❌ No, I forgot</button>
-          <button id="wizard-verify-yes" class="wizard-btn wizard-btn-neon" type="button">✅ Yes, it's ready!</button>
-        </div>
-      </div>
-
-      <div id="wizard-step-2" class="wizard-step hidden">
-        <p class="wizard-context-warning">⚠️ Please keep Chrome open. The background macro is establishing a secure connection...</p>
-        <div class="wizard-gif-wrap">
-          <img src="macro-guide.gif" id="macro-guide-gif" alt="Auto-Scan guide animation" />
-        </div>
-        <div id="wizard-giant-countdown" class="wizard-giant-countdown" aria-live="assertive"></div>
+  <!-- Reset Workspace Modal -->
+  <div id="reset-workspace-overlay" class="hidden" role="dialog" aria-modal="true" aria-labelledby="reset-workspace-heading">
+    <div class="reset-workspace-card">
+      <div class="reset-workspace-glow" aria-hidden="true"></div>
+      <h2 id="reset-workspace-heading">⚠️ Reset Workspace</h2>
+      <p class="reset-workspace-text">Are you sure you want to nuke your entire workspace? This will delete all saved groups and folders.</p>
+      <div class="wizard-actions">
+        <button id="reset-workspace-cancel" class="wizard-btn wizard-btn-muted" type="button">Cancel</button>
+        <button id="reset-workspace-confirm" class="wizard-btn wizard-btn-neon-red" type="button">Yes, Nuke It</button>
       </div>
     </div>
   </div>
@@ -213,7 +252,6 @@
   <div id="toast-container"></div>
 
   <script src="Sortable.min.js"></script>
-  <script src="macro-wizard.js"></script>
   <script src="dashboard.js"></script>
 </body>
 </html>

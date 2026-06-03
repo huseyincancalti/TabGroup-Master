@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "TabGroup Master",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzDftIlUqwbwYuuxiCbOwzJQfHCnB1ptWUUJdspmNNDYPm+zqHpCuH61mbto1h3e6mQ6Rj0zTXgzMQGIDu39gWAqNlmPdzFT14N5XMCKXfopEFd5i+E74agT7b16Qu16fE7gVwYpwLtdb5df9qvYx13lylP5/uo51h9QwmDXJM0ulrowIu53qTwoOXX9UWYkNpFz3VMTkjZa4nPSrZJoW12/MqmKUYumUgCPWQgGPJ8YrmW3zjPvJ1AagwuDsTNFq9/HU/i/uViYrd79wKtPD0/FwdG67SN0XvwhwHG/Xrm8NaFLxze4BmjnnTGPN7upEoqZeq/+RweZfDCr48sUE3wIDAQAB",
-  "description": "Manage, categorize, and sort your Chrome tab groups with a powerful side panel.",
+  "description": "Capture, organize, and restore your Chrome tab groups with nested folders and JSON backup.",
   "permissions": [
     "tabGroups",
     "tabs",

@@ -1,26 +1,18 @@
 @echo off
-setlocal
-echo Kurulum yapiliyor... Lutfen bekleyin.
-
-:: Bulundugu klasorun yolunu al ve cift ters slash (\\) formatina cevir
-set "HOST_DIR=%~dp0"
-set "HOST_DIR=%HOST_DIR:\=\\%"
-
-:: JSON dosyasini otomatik olarak yarat!
-echo {> com.tabgroup.master.json
-echo   "name": "com.tabgroup.master",>> com.tabgroup.master.json
-echo   "description": "TabGroup Master Native Host",>> com.tabgroup.master.json
-echo   "path": "%HOST_DIR%importer.exe",>> com.tabgroup.master.json
-echo   "type": "stdio",>> com.tabgroup.master.json
-echo   "allowed_origins": [>> com.tabgroup.master.json
-echo     "chrome-extension://jdkmjfpnajeaiojbmagembcihnjckooh/">> com.tabgroup.master.json
-echo   ]>> com.tabgroup.master.json
-echo }>> com.tabgroup.master.json
-
-:: Kayit defterine ekle
-REG ADD "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.tabgroup.master" /ve /t REG_SZ /d "%~dp0com.tabgroup.master.json" /f
-
-echo Basarili!
-echo JSON dosyasi bilgisayariniza ozel olarak otomatik uretildi ve sisteme islendi. 
-echo Artik eklentiyi kullanabilirsiniz.
+python "%~dp0setup.py"
+if errorlevel 1 (
+    echo.
+    echo Installation failed. Make sure Python is installed.
+    pause
+    exit /b 1
+)
+echo.
+echo Checking dependencies...
+python -c "import cramjam" 2>nul
+if errorlevel 1 (
+    echo Installing cramjam...
+    python -m pip install cramjam
+)
+echo.
+echo Done. Restart Chrome if it was open.
 pause

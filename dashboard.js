@@ -5,16 +5,19 @@ const COLOR_HEX = {
   green: "#81c995", pink: "#f48fb1", purple: "#d7aefb", cyan: "#78d9ec", orange: "#fcad70",
 };
 
+const INBOX_PAGE_SIZE = 50;
+
 let state = {
   savedGroups: [],
   folders: [],
   activeView: "overview",
-  // Normalized O(1) indexes rebuilt after every loadData() / state mutation
-  groupIndex: new Map(),          // uid -> group
-  folderIndex: new Map(),         // id  -> folder
-  childFoldersByParent: new Map(),// parentKey -> folder[]
-  childGroupsByFolder: new Map(), // folderId  -> group[]
+  groupIndex: new Map(),
+  folderIndex: new Map(),
+  childFoldersByParent: new Map(),
+  childGroupsByFolder: new Map(),
   inboxGroups: [],
+  inboxFilter: "",
+  inboxPage: 0,
 };
 
 let modalContext = null;
@@ -23,22 +26,12 @@ const sortableInstances = [];
 document.addEventListener("DOMContentLoaded", async () => {
   await loadData();
   bindListeners();
-  MacroWizard.init({
-    showToast,
-    onImportModeEnabled: async () => {
-      await loadData();
-    },
-    onComplete: async () => {
-      await loadData();
-      render();
-    },
-  });
   render();
 });
 
 chrome.storage.onChanged.addListener(async (changes, area) => {
   if (area !== "local") return;
-  if (changes.savedGroups || changes.folders || changes.conflicts || changes.importMode) {
+  if (changes.savedGroups || changes.folders) {
     await loadData();
     render();
   }
@@ -79,6 +72,11 @@ async function loadData() {
 
 // Rebuild all O(1) lookup indexes from the flat arrays.
 // Must be called after any in-place state mutation.
+function getGroupTabCount(group) {
+  if (typeof group.tabCount === "number") return group.tabCount;
+  return (group.tabs || []).length;
+}
+
 function buildIndexes() {
   state.groupIndex = new Map(state.savedGroups.map((g) => [g.uid, g]));
   state.folderIndex = new Map(state.folders.map((f) => [f.id, f]));
@@ -113,12 +111,28 @@ function switchView(view) {
   });
   if (view === "workspace") {
     renderTree();
+  } else if (view === "cleanup") {
+    renderCleanup();
   }
 }
 
+function normalizeText(str) {
+  return String(str)
+    .replace(/İ/g, "i").replace(/I/g, "i").replace(/ı/g, "i")
+    .replace(/Ğ/g, "g").replace(/ğ/g, "g")
+    .replace(/Ü/g, "u").replace(/ü/g, "u")
+    .replace(/Ş/g, "s").replace(/ş/g, "s")
+    .replace(/Ö/g, "o").replace(/ö/g, "o")
+    .replace(/Ç/g, "c").replace(/ç/g, "c")
+    .toLowerCase();
+}
+
 function render() {
-  if (state.activeView === "workspace" || document.getElementById("view-workspace")?.classList.contains("active")) {
+  const view = state.activeView;
+  if (view === "workspace" || document.getElementById("view-workspace")?.classList.contains("active")) {
     renderTree();
+  } else if (view === "cleanup") {
+    renderCleanup();
   }
 }
 
@@ -160,17 +174,34 @@ function renderInbox() {
   const list = document.getElementById("dashboard-inbox-list");
   const empty = document.getElementById("inbox-empty");
   const countEl = document.getElementById("inbox-count");
+  const moreBtn = document.getElementById("inbox-show-more");
   if (!list) return;
 
-  const groups = getInboxGroups();
-  // Build off-DOM via DocumentFragment — single reflow
+  const allGroups = getInboxGroups();
+  const q = normalizeText(state.inboxFilter);
+  const filtered = q
+    ? allGroups.filter((g) => normalizeText(g.title || "unnamed group").includes(q))
+    : allGroups;
+
+  const limit = (state.inboxPage + 1) * INBOX_PAGE_SIZE;
+  const visible = filtered.slice(0, limit);
+  const remaining = filtered.length - limit;
+
   const frag = document.createDocumentFragment();
-  groups.forEach((group) => frag.appendChild(buildGroupNode(group, { inInbox: true })));
+  visible.forEach((group) => frag.appendChild(buildGroupNode(group, { inInbox: true })));
   list.innerHTML = "";
   list.appendChild(frag);
 
-  if (countEl) countEl.textContent = String(groups.length);
-  if (empty) empty.classList.toggle("hidden", groups.length > 0);
+  if (countEl) countEl.textContent = q ? `${filtered.length}/${allGroups.length}` : String(allGroups.length);
+  if (empty) empty.classList.toggle("hidden", allGroups.length > 0);
+  if (moreBtn) {
+    if (remaining > 0) {
+      moreBtn.textContent = `Show ${Math.min(INBOX_PAGE_SIZE, remaining)} more (${remaining} left)`;
+      moreBtn.classList.remove("hidden");
+    } else {
+      moreBtn.classList.add("hidden");
+    }
+  }
 }
 
 function renderFoldersTree() {
@@ -288,12 +319,21 @@ function buildFolderNode(folder) {
   wrapper.querySelector(".action-delete").addEventListener("click", async (e) => {
     e.stopPropagation();
     if (!confirm(`Delete folder "${folder.name}"? Groups return to Inbox; sub-folders move to root.`)) return;
-    const res = await sendMsg({ action: "deleteFolder", folderId: folder.id });
-    if (res?.ok) {
-      showToast("Folder deleted", "success");
-      await loadData();
-      renderTree();
-    }
+    wrapper.remove();
+    state.folders = state.folders.filter((f) => f.id !== folder.id);
+    state.savedGroups.forEach((g) => {
+      if (g.folderId === folder.id) g.folderId = null;
+    });
+    buildIndexes();
+    showToast("Folder deleted", "success");
+    sendMsg({ action: "deleteFolder", folderId: folder.id })
+      .then(async (res) => {
+        if (!res?.ok) {
+          showToast("Could not delete folder", "error");
+          await loadData();
+          renderTree();
+        }
+      });
   });
 
   return wrapper;
@@ -307,7 +347,7 @@ function buildGroupNode(group, options = {}) {
   node.dataset.groupUid = group.uid;
 
   const dot = COLOR_HEX[group.color] || COLOR_HEX.grey;
-  const tabs = (group.tabs || []).length;
+  const tabs = getGroupTabCount(group);
   const title = escHtml(group.title || "Unnamed Group");
   const statusClass = group.active ? "active" : "saved";
   const statusLabel = group.active ? "Active" : "Saved";
@@ -347,25 +387,84 @@ function buildGroupNode(group, options = {}) {
     await openOrFocusGroup(group);
   });
 
+  const titleEl = node.querySelector(".tree-group-title");
+  if (titleEl) {
+    titleEl.addEventListener("dblclick", (e) => {
+      e.stopPropagation();
+      startInlineGroupRename(group, node, titleEl);
+    });
+  }
+
+  const metaEl = node.querySelector(".tree-group-meta");
+  if (metaEl) {
+    metaEl.classList.add("tree-group-meta-expandable");
+    metaEl.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await toggleTreeGroupTabs(node, group);
+    });
+  }
+
   const removeEl = node.querySelector(".action-remove");
   if (removeEl) {
     removeEl.addEventListener("click", (e) => {
       e.stopPropagation();
-      // Optimistic: remove node from DOM and update indexes instantly
       node.remove();
       const g = state.groupIndex.get(group.uid);
-      if (g) {
-        g.folderId = null;
-        buildIndexes();
-      }
+      if (g) { g.folderId = null; buildIndexes(); }
       showToast("Moved to Inbox", "success");
-      // Async persistence — does not block UI
       sendMsg({ action: "removeGroupFromFolder", groupUid: group.uid })
         .then(() => loadData().then(renderTree));
     });
   }
 
   return node;
+}
+
+function renderTreeTabsList(listEl, tabs) {
+  listEl.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  tabs.forEach((t) => {
+    const li = document.createElement("li");
+    li.className = "tree-group-tab-item";
+    li.textContent = t.title || t.url || "Untitled";
+    li.title = t.url || "";
+    frag.appendChild(li);
+  });
+  listEl.appendChild(frag);
+}
+
+async function toggleTreeGroupTabs(node, group) {
+  let list = node.querySelector(".tree-group-tabs-list");
+  if (list && !list.classList.contains("hidden")) {
+    list.classList.add("hidden");
+    return;
+  }
+  if (!list) {
+    list = document.createElement("ul");
+    list.className = "tree-group-tabs-list";
+    node.appendChild(list);
+  }
+  list.classList.remove("hidden");
+  if (group.tabsLoaded && group.tabs?.length) {
+    renderTreeTabsList(list, group.tabs);
+    return;
+  }
+  list.innerHTML = "<li class=\"tree-group-tab-loading\">Loading…</li>";
+  const res = await sendMsg({ action: "loadGroupTabs", groupUid: group.uid });
+  if (!res?.ok) {
+    list.innerHTML = "<li class=\"tree-group-tab-empty\">Could not load tabs</li>";
+    return;
+  }
+  group.tabs = res.tabs || [];
+  group.tabCount = group.tabs.length;
+  group.tabsLoaded = true;
+  const indexed = state.groupIndex.get(group.uid);
+  if (indexed) {
+    indexed.tabs = group.tabs;
+    indexed.tabCount = group.tabCount;
+    indexed.tabsLoaded = true;
+  }
+  renderTreeTabsList(list, group.tabs);
 }
 
 async function openOrFocusGroup(group) {
@@ -433,6 +532,175 @@ function startInlineRename(folder, wrapperEl) {
   input.addEventListener("blur", commit);
 }
 
+function startInlineGroupRename(group, nodeEl, titleEl) {
+  const current = group.title || "";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "tree-folder-rename";
+  input.value = current;
+  titleEl.replaceWith(input);
+  input.focus();
+  input.select();
+  let committed = false;
+  const commit = async () => {
+    if (committed) return;
+    committed = true;
+    const newTitle = input.value.trim();
+    if (newTitle !== current) {
+      await sendMsg({ action: "updateGroupTitle", groupUid: group.uid, title: newTitle });
+      showToast("Group renamed", "success");
+    }
+    await loadData();
+    renderTree();
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") commit();
+    if (e.key === "Escape") { committed = true; renderTree(); }
+  });
+  input.addEventListener("blur", commit);
+}
+
+function renderCleanup() {
+  renderCleanupUnnamed();
+  renderCleanupDuplicates();
+}
+
+function renderCleanupUnnamed() {
+  const container = document.getElementById("cleanup-unnamed-list");
+  const badge = document.getElementById("cleanup-unnamed-badge");
+  if (!container) return;
+
+  const groups = state.savedGroups.filter((g) => {
+    if (g.active) return false;
+    const t = (g.title || "").trim();
+    return t.length <= 1 || (g.tabCount || 0) === 0;
+  });
+
+  if (badge) badge.textContent = String(groups.length);
+
+  if (!groups.length) {
+    container.innerHTML = '<p class="cleanup-empty">No unnamed or empty groups.</p>';
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  groups.forEach((group) => {
+    const row = document.createElement("div");
+    row.className = "cleanup-row";
+    row.dataset.uid = group.uid;
+    const dot = COLOR_HEX[group.color] || COLOR_HEX.grey;
+    const tabs = group.tabCount || 0;
+    const displayTitle = (group.title || "").trim() || "Unnamed";
+    row.innerHTML = `
+      <input type="checkbox" class="cleanup-check" />
+      <span class="cleanup-dot" style="background:${dot}"></span>
+      <span class="cleanup-title" title="${escHtml(displayTitle)}">${escHtml(displayTitle)}</span>
+      <span class="cleanup-tabcount">${tabs} tab${tabs !== 1 ? "s" : ""}</span>
+      <button class="cleanup-btn-del" type="button" title="Delete this group">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+      </button>
+    `;
+    row.querySelector(".cleanup-btn-del").addEventListener("click", async () => {
+      row.remove();
+      state.savedGroups = state.savedGroups.filter((g) => g.uid !== group.uid);
+      buildIndexes();
+      showToast("Deleted", "success");
+      await sendMsg({ action: "deleteGroup", groupUid: group.uid });
+    });
+    frag.appendChild(row);
+  });
+  container.innerHTML = "";
+  container.appendChild(frag);
+}
+
+function renderCleanupDuplicates() {
+  const container = document.getElementById("cleanup-duplicates-list");
+  const badge = document.getElementById("cleanup-duplicates-badge");
+  if (!container) return;
+
+  const byTitle = new Map();
+  for (const g of state.savedGroups) {
+    if (g.active) continue;
+    const key = normalizeText(g.title || "");
+    if (!key) continue;
+    if (!byTitle.has(key)) byTitle.set(key, []);
+    byTitle.get(key).push(g);
+  }
+
+  const dupSets = [...byTitle.values()].filter((arr) => arr.length > 1);
+  if (badge) badge.textContent = String(dupSets.length);
+
+  if (!dupSets.length) {
+    container.innerHTML = '<p class="cleanup-empty">No duplicate groups.</p>';
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  dupSets.forEach((groups) => {
+    const sorted = [...groups].sort((a, b) => (b.tabCount || 0) - (a.tabCount || 0));
+    const card = document.createElement("div");
+    card.className = "cleanup-dup-card";
+    const titleHtml = escHtml(sorted[0].title || "Unnamed");
+    const totalTabs = groups.reduce((s, g) => s + (g.tabCount || 0), 0);
+
+    card.innerHTML = `
+      <div class="cleanup-dup-header">
+        <strong class="cleanup-dup-name">${titleHtml}</strong>
+        <span class="cleanup-dup-meta">${groups.length} groups · ${totalTabs} total tabs</span>
+      </div>
+      <div class="cleanup-dup-rows"></div>
+      <div class="cleanup-dup-footer">
+        <button class="cleanup-btn-merge wizard-btn wizard-btn-neon" type="button">
+          Merge all → keep largest
+        </button>
+      </div>
+    `;
+
+    const rowsEl = card.querySelector(".cleanup-dup-rows");
+    sorted.forEach((g, idx) => {
+      const dot = COLOR_HEX[g.color] || COLOR_HEX.grey;
+      const tabs = g.tabCount || 0;
+      const where = g.folderId
+        ? (state.folderIndex.get(g.folderId)?.name || "folder")
+        : "Inbox";
+      const row = document.createElement("div");
+      row.className = "cleanup-dup-row";
+      row.innerHTML = `
+        <span class="cleanup-dot" style="background:${dot}"></span>
+        <span class="cleanup-dup-row-info">${tabs} tab${tabs !== 1 ? "s" : ""} · ${escHtml(where)}</span>
+        ${idx === 0
+          ? `<span class="cleanup-keep-badge">Keep</span>`
+          : `<button class="cleanup-btn-del-dup" type="button">Delete</button>`
+        }
+      `;
+      if (idx > 0) {
+        row.querySelector(".cleanup-btn-del-dup").addEventListener("click", async () => {
+          card.remove();
+          await sendMsg({ action: "deleteGroup", groupUid: g.uid });
+          await loadData();
+          renderCleanupDuplicates();
+          showToast("Deleted", "success");
+        });
+      }
+      rowsEl.appendChild(row);
+    });
+
+    card.querySelector(".cleanup-btn-merge").addEventListener("click", async () => {
+      const keep = sorted[0];
+      for (let i = 1; i < sorted.length; i++) {
+        await sendMsg({ action: "mergeGroups", keepUid: keep.uid, mergeUid: sorted[i].uid });
+      }
+      await loadData();
+      renderCleanup();
+      showToast(`Merged ${sorted.length} → 1 group`, "success");
+    });
+
+    frag.appendChild(card);
+  });
+  container.innerHTML = "";
+  container.appendChild(frag);
+}
+
 function destroySortables() {
   sortableInstances.forEach((s) => {
     try {
@@ -449,7 +717,7 @@ function initSortableEverywhere() {
     const isInbox = listEl.dataset.folderId === "inbox";
     const instance = Sortable.create(listEl, {
       group: "shared",
-      animation: 150,
+      animation: 0,
       fallbackOnBody: true,
       swapThreshold: 0.65,
       ghostClass: "sortable-ghost",
@@ -546,6 +814,30 @@ async function confirmCreateFolder() {
   }
 }
 
+async function refreshWorkspace() {
+  await loadData();
+  render();
+  showToast("Workspace refreshed", "success");
+}
+
+function openResetWorkspaceModal() {
+  document.getElementById("reset-workspace-overlay")?.classList.remove("hidden");
+}
+
+function closeResetWorkspaceModal() {
+  document.getElementById("reset-workspace-overlay")?.classList.add("hidden");
+}
+
+async function confirmResetWorkspace() {
+  closeResetWorkspaceModal();
+  await chrome.storage.local.remove(["savedGroups", "folders"]);
+  state.savedGroups = [];
+  state.folders = [];
+  buildIndexes();
+  render();
+  showToast("Workspace reset", "success");
+}
+
 function bindListeners() {
   document.querySelectorAll(".nav-btn").forEach((btn) => {
     btn.addEventListener("click", () => switchView(btn.dataset.view));
@@ -566,6 +858,54 @@ function bindListeners() {
   });
 
   document.getElementById("btn-export-json")?.addEventListener("click", exportToJson);
+
+  const importInput = document.getElementById("import-file-input");
+  document.getElementById("btn-import-json")?.addEventListener("click", () => importInput?.click());
+  importInput?.addEventListener("change", importFromJson);
+
+  document.getElementById("inbox-search")?.addEventListener("input", (e) => {
+    state.inboxFilter = e.target.value;
+    state.inboxPage = 0;
+    renderInbox();
+  });
+
+  document.getElementById("inbox-show-more")?.addEventListener("click", () => {
+    state.inboxPage++;
+    renderInbox();
+  });
+
+  document.getElementById("cleanup-delete-selected")?.addEventListener("click", async () => {
+    const checked = [...document.querySelectorAll(".cleanup-check:checked")];
+    const uids = checked.map((cb) => cb.closest(".cleanup-row")?.dataset.uid).filter(Boolean);
+    if (!uids.length) { showToast("Select groups first", "info"); return; }
+    const res = await sendMsg({ action: "deleteMultipleGroups", groupUids: uids });
+    if (res?.ok) {
+      showToast(`Deleted ${res.deleted} group${res.deleted !== 1 ? "s" : ""}`, "success");
+      await loadData();
+      renderCleanup();
+    }
+  });
+
+  document.getElementById("cleanup-select-all")?.addEventListener("click", () => {
+    document.querySelectorAll(".cleanup-check").forEach((cb) => { cb.checked = true; });
+  });
+
+  document.getElementById("cleanup-deselect-all")?.addEventListener("click", () => {
+    document.querySelectorAll(".cleanup-check").forEach((cb) => { cb.checked = false; });
+  });
+
+  document.getElementById("btn-refresh-workspace")?.addEventListener("click", refreshWorkspace);
+  document.getElementById("btn-reset-workspace")?.addEventListener("click", openResetWorkspaceModal);
+  document.getElementById("reset-workspace-cancel")?.addEventListener("click", closeResetWorkspaceModal);
+  document.getElementById("reset-workspace-confirm")?.addEventListener("click", confirmResetWorkspace);
+  document.getElementById("reset-workspace-overlay")?.addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) closeResetWorkspaceModal();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !document.getElementById("reset-workspace-overlay")?.classList.contains("hidden")) {
+      closeResetWorkspaceModal();
+    }
+  });
 }
 
 async function exportToJson() {
@@ -588,6 +928,28 @@ async function exportToJson() {
   a.remove();
   URL.revokeObjectURL(url);
   showToast("Backup exported successfully", "success");
+}
+
+async function importFromJson(event) {
+  const input = event.target;
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+  let data;
+  try {
+    data = JSON.parse(await file.text());
+  } catch (_) {
+    showToast("Invalid JSON file", "error");
+    return;
+  }
+  const res = await sendMsg({ action: "importJson", data });
+  if (res?.ok) {
+    await loadData();
+    render();
+    showToast(`Imported ${res.added} group${res.added !== 1 ? "s" : ""}`, "success");
+  } else {
+    showToast(res?.error || "Import failed", "error");
+  }
 }
 
 function showToast(message, type = "info") {
