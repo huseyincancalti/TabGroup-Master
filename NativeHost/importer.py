@@ -25,9 +25,17 @@ def main():
         message = read_message()
         if message is None:
             return
-        if message.get("action") == "extract":
+        action = message.get("action")
+        if action == "listProfiles":
             try:
-                data = tabgroups.extract()
+                profiles = tabgroups.list_profiles()
+                send_message({"action": "listProfilesResult", "ok": True, "profiles": profiles})
+            except Exception as exc:
+                send_message({"action": "listProfilesResult", "ok": False, "error": str(exc), "profiles": []})
+        elif action == "extract":
+            try:
+                profile_dirs = message.get("profileDirs")  # None = all profiles
+                data = tabgroups.extract(profile_dirs=profile_dirs)
                 send_message({"action": "extractResult", "ok": True, "data": data})
             except Exception as exc:
                 send_message({"action": "extractResult", "ok": False, "error": str(exc)})

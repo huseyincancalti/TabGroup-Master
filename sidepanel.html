@@ -122,8 +122,30 @@
     </div>
   </div>
 
-  <div id="import-overlay" class="hidden" role="dialog" aria-modal="true" aria-labelledby="import-heading">
-    <div class="capture-card">
+  <div id="import-overlay" class="hidden" role="dialog" aria-modal="true">
+    <!-- Step 1: Profile Picker -->
+    <div id="step-picker" class="capture-card">
+      <div class="capture-glow" aria-hidden="true"></div>
+      <h2 class="picker-heading">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>
+        Choose Profiles
+      </h2>
+      <p class="capture-text">Select which Chrome accounts to import from.</p>
+      <div id="profile-list-loading" class="profile-loading">
+        <div class="profile-spinner"></div>
+        <span>Detecting profiles…</span>
+      </div>
+      <div id="profile-list" class="profile-list hidden"></div>
+      <div id="profile-actions" class="profile-actions hidden">
+        <button id="btn-picker-cancel" class="btn-secondary-sp" type="button">Cancel</button>
+        <button id="btn-picker-confirm" class="btn-primary-sp" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Import Selected
+        </button>
+      </div>
+    </div>
+    <!-- Step 2: Importing spinner -->
+    <div id="step-importing" class="capture-card hidden">
       <div class="capture-glow" aria-hidden="true"></div>
       <div class="import-spinner" aria-hidden="true"></div>
       <h2 id="import-heading">📥 Importing…</h2>

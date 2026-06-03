@@ -17,12 +17,11 @@ function broadcast(payload) {
 
 function normalizeTitle(value) {
   return String(value || "")
-    .replace(/İ/g, "i").replace(/I/g, "i").replace(/ı/g, "i")
-    .replace(/Ğ/g, "g").replace(/ğ/g, "g")
-    .replace(/Ü/g, "u").replace(/ü/g, "u")
-    .replace(/Ş/g, "s").replace(/ş/g, "s")
-    .replace(/Ö/g, "o").replace(/ö/g, "o")
-    .replace(/Ç/g, "c").replace(/ç/g, "c")
+    // Turkish dotless-i has no NFD decomposition — must be explicit
+    .replace(/İ/g, "i").replace(/ı/g, "i")
+    // NFD decomposition strips all other diacritics (ç→c, ü→u, é→e, ñ→n …)
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
     .trim()
     .toLowerCase();
 }
@@ -190,49 +189,74 @@ async function reconcileInner() {
   broadcast({ type: "STORE_UPDATED" });
 }
 
-function importFromChrome() {
-  return new Promise((resolve) => {
-    let port;
-    try {
-      port = chrome.runtime.connectNative(NATIVE_HOST_NAME);
-    } catch (e) {
-      resolve({ ok: false, error: "Native host not found. Run NativeHost/install.bat, then restart Chrome." });
-      return;
-    }
-    if (!port) {
-      resolve({ ok: false, error: "Native host not found. Run NativeHost/install.bat, then restart Chrome." });
-      return;
-    }
+function _connectNative(onMsg, onError) {
+  let port;
+  try {
+    port = chrome.runtime.connectNative(NATIVE_HOST_NAME);
+  } catch (_) {
+    onError("Native host not found. Run NativeHost/install.bat, then restart Chrome.");
+    return null;
+  }
+  if (!port) {
+    onError("Native host not found. Run NativeHost/install.bat, then restart Chrome.");
+    return null;
+  }
+  port.onDisconnect.addListener(() => {
+    const err = chrome.runtime.lastError?.message;
+    onError(err || "Native host disconnected. Run install.bat and restart Chrome.");
+  });
+  port.onMessage.addListener(onMsg);
+  return port;
+}
 
+function listChromeProfiles() {
+  return new Promise((resolve) => {
     let settled = false;
     const finish = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      try { port.disconnect(); } catch (_) {}
+      try { port?.disconnect(); } catch (_) {}
       resolve(result);
     };
+    const port = _connectNative(
+      (msg) => {
+        if (msg?.action !== "listProfilesResult") return;
+        finish(msg);
+      },
+      (err) => finish({ ok: false, error: err, profiles: [] })
+    );
+    if (!port) return;
+    const timer = setTimeout(() => finish({ ok: false, error: "Timed out waiting for native host", profiles: [] }), 10_000);
+    port.postMessage({ action: "listProfiles" });
+  });
+}
 
-    port.onDisconnect.addListener(() => {
-      const err = chrome.runtime.lastError?.message;
-      finish({ ok: false, error: err || "Native host disconnected. Run install.bat and restart Chrome." });
-    });
-
-    port.onMessage.addListener(async (msg) => {
-      if (msg?.action !== "extractResult") return;
-      if (!msg.ok) {
-        finish({ ok: false, error: msg.error || "Extraction failed" });
-        return;
-      }
-      const res = await importStore(msg.data);
-      finish({ ok: true, added: res.added, total: (msg.data?.savedGroups || []).length });
-    });
-
+function importFromChrome(profileDirs = null) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { port?.disconnect(); } catch (_) {}
+      resolve(result);
+    };
+    const port = _connectNative(
+      async (msg) => {
+        if (msg?.action !== "extractResult") return;
+        if (!msg.ok) { finish({ ok: false, error: msg.error || "Extraction failed" }); return; }
+        const res = await importStore(msg.data);
+        finish({ ok: true, added: res.added, total: (msg.data?.savedGroups || []).length });
+      },
+      (err) => finish({ ok: false, error: err })
+    );
+    if (!port) return;
     const timer = setTimeout(
       () => finish({ ok: false, error: "Timed out waiting for native host" }),
       IMPORT_TIMEOUT_MS
     );
-    port.postMessage({ action: "extract" });
+    port.postMessage({ action: "extract", profileDirs });
   });
 }
 
@@ -287,8 +311,12 @@ const handlers = {
     return getStore();
   },
 
-  async importFromChrome() {
-    return importFromChrome();
+  async listChromeProfiles() {
+    return listChromeProfiles();
+  },
+
+  async importFromChrome({ profileDirs } = {}) {
+    return importFromChrome(profileDirs || null);
   },
 
   async loadGroupTabs({ groupUid }) {

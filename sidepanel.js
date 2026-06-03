@@ -70,12 +70,9 @@ function getGroupTabCount(group) {
 
 function normalizeText(value) {
   return String(value)
-    .replace(/İ/g, "i").replace(/I/g, "i").replace(/ı/g, "i")
-    .replace(/Ğ/g, "g").replace(/ğ/g, "g")
-    .replace(/Ü/g, "u").replace(/ü/g, "u")
-    .replace(/Ş/g, "s").replace(/ş/g, "s")
-    .replace(/Ö/g, "o").replace(/ö/g, "o")
-    .replace(/Ç/g, "c").replace(/ç/g, "c")
+    .replace(/İ/g, "i").replace(/ı/g, "i")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
     .toLowerCase();
 }
 
@@ -379,23 +376,108 @@ async function confirmEditGroup() {
 
 let _importing = false;
 
-async function runImport() {
-  if (_importing) return;
-  _importing = true;
+// ── Import overlay helpers ──────────────────────────────────────────────────
+
+function showImportOverlay() {
   document.getElementById("import-overlay")?.classList.remove("hidden");
+}
+
+function hideImportOverlay() {
+  document.getElementById("import-overlay")?.classList.add("hidden");
+}
+
+function setImportStep(step) {
+  // step: "loading" | "picker" | "importing"
+  const pickerEl    = document.getElementById("step-picker");
+  const importingEl = document.getElementById("step-importing");
+  const loadingEl   = document.getElementById("profile-list-loading");
+  const listEl      = document.getElementById("profile-list");
+  const actionsEl   = document.getElementById("profile-actions");
+  if (!pickerEl || !importingEl) return;
+
+  if (step === "loading") {
+    pickerEl.classList.remove("hidden");
+    importingEl.classList.add("hidden");
+    loadingEl?.classList.remove("hidden");
+    listEl?.classList.add("hidden");
+    actionsEl?.classList.add("hidden");
+  } else if (step === "picker") {
+    pickerEl.classList.remove("hidden");
+    importingEl.classList.add("hidden");
+    loadingEl?.classList.add("hidden");
+    listEl?.classList.remove("hidden");
+    actionsEl?.classList.remove("hidden");
+  } else if (step === "importing") {
+    pickerEl.classList.add("hidden");
+    importingEl.classList.remove("hidden");
+  }
+}
+
+function populateProfileList(profiles) {
+  const list = document.getElementById("profile-list");
+  if (!list) return;
+  list.innerHTML = "";
+  profiles.forEach((p) => {
+    const label = document.createElement("label");
+    label.className = "profile-item";
+    const initial = (p.displayName || p.profileName || "?")[0].toUpperCase();
+    label.innerHTML = `
+      <input type="checkbox" class="profile-check" value="${escHtml(p.dir)}" checked />
+      <div class="profile-avatar">${escHtml(initial)}</div>
+      <div class="profile-info">
+        <span class="profile-display-name">${escHtml(p.displayName || p.profileName)}</span>
+        ${p.email ? `<span class="profile-email">${escHtml(p.email)}</span>` : ""}
+      </div>`;
+    list.appendChild(label);
+  });
+}
+
+async function doImport(profileDirs) {
+  setImportStep("importing");
   try {
-    const res = await sendMsg({ action: "importFromChrome" });
+    const res = await sendMsg({ action: "importFromChrome", profileDirs: profileDirs || null });
     if (res?.ok) {
       await loadData();
       render();
-      showToast(`Imported ${res.added} new group${res.added !== 1 ? "s" : ""} (${res.total} found)`, "success");
+      const msg = res.added > 0
+        ? `Imported ${res.added} new group${res.added !== 1 ? "s" : ""} (${res.total} found)`
+        : `No new groups — ${res.total} already up to date`;
+      showToast(msg, res.added > 0 ? "success" : "info");
     } else {
       showToast(res?.error || "Import failed", "error");
     }
   } finally {
     _importing = false;
-    document.getElementById("import-overlay")?.classList.add("hidden");
+    hideImportOverlay();
   }
+}
+
+async function runImport() {
+  if (_importing) return;
+  _importing = true;
+
+  setImportStep("loading");
+  showImportOverlay();
+
+  const profilesRes = await sendMsg({ action: "listChromeProfiles" });
+
+  if (!profilesRes?.ok) {
+    hideImportOverlay();
+    _importing = false;
+    showToast(profilesRes?.error || "Native host not found — run NativeHost/install.bat first", "error");
+    return;
+  }
+
+  const profiles = profilesRes.profiles || [];
+
+  // 0 or 1 profile → skip the picker, import immediately
+  if (profiles.length <= 1) {
+    await doImport(null);
+    return;
+  }
+
+  populateProfileList(profiles);
+  setImportStep("picker");
 }
 
 async function refreshWorkspace() {
@@ -429,6 +511,17 @@ function bindStaticListeners() {
 
   document.getElementById("btn-import-chrome")?.addEventListener("click", runImport);
 
+  document.getElementById("btn-picker-cancel")?.addEventListener("click", () => {
+    _importing = false;
+    hideImportOverlay();
+  });
+
+  document.getElementById("btn-picker-confirm")?.addEventListener("click", async () => {
+    const checked = [...document.querySelectorAll(".profile-check:checked")];
+    const dirs = checked.map((cb) => cb.value).filter(Boolean);
+    await doImport(dirs.length > 0 ? dirs : null);
+  });
+
   document.getElementById("btn-refresh-workspace")?.addEventListener("click", refreshWorkspace);
   document.getElementById("btn-reset-workspace")?.addEventListener("click", openResetWorkspaceModal);
   document.getElementById("sp-reset-cancel")?.addEventListener("click", closeResetWorkspaceModal);
@@ -460,6 +553,14 @@ function bindStaticListeners() {
     if (e.key !== "Escape") return;
     if (!document.getElementById("sp-reset-overlay")?.classList.contains("hidden")) {
       closeResetWorkspaceModal();
+    }
+    // Cancel import only on the picker step (not while actually importing)
+    const overlay = document.getElementById("import-overlay");
+    const pickerStep = document.getElementById("step-picker");
+    if (overlay && !overlay.classList.contains("hidden") &&
+        pickerStep && !pickerStep.classList.contains("hidden")) {
+      _importing = false;
+      hideImportOverlay();
     }
   });
 }

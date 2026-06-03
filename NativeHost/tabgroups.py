@@ -1,5 +1,6 @@
 import os
 import glob
+import json
 import shutil
 import tempfile
 import time
@@ -82,6 +83,42 @@ def _decode(buf, depth=0):
     return fields
 
 
+def list_profiles():
+    """Return metadata for every Chrome profile that has a Sync Data/LevelDB directory."""
+    user_data = _chrome_user_data_dir()
+    if not user_data:
+        return []
+    profiles = []
+    profile_names = ["Default"] + [
+        os.path.basename(p) for p in glob.glob(os.path.join(user_data, "Profile *"))
+    ]
+    for name in profile_names:
+        leveldb = os.path.join(user_data, name, "Sync Data", "LevelDB")
+        if not os.path.isdir(leveldb):
+            continue
+        display_name = name
+        email = ""
+        try:
+            prefs_path = os.path.join(user_data, name, "Preferences")
+            with open(prefs_path, "r", encoding="utf-8", errors="ignore") as f:
+                prefs = json.load(f)
+            acct_list = prefs.get("account_info", [])
+            if isinstance(acct_list, list) and acct_list:
+                email = acct_list[0].get("email", "")
+            pname = prefs.get("profile", {}).get("name", "")
+            if pname:
+                display_name = pname
+        except Exception:
+            pass
+        profiles.append({
+            "dir": leveldb,
+            "profileName": name,
+            "displayName": display_name,
+            "email": email,
+        })
+    return profiles
+
+
 def _chrome_user_data_dir():
     local = os.environ.get("LOCALAPPDATA", "")
     candidates = [
@@ -119,15 +156,24 @@ def _read_entities(leveldb_dir):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def extract():
+def extract(profile_dirs=None):
+    """Extract all saved tab groups.
+
+    profile_dirs: list of absolute LevelDB directory paths to scan, or None to scan all.
+    """
     user_data = _chrome_user_data_dir()
-    if not user_data:
-        return {"savedGroups": [], "folders": [], "error": "Chrome profile not found"}
+
+    if profile_dirs is not None:
+        dirs = [d for d in profile_dirs if isinstance(d, str) and os.path.isdir(d)]
+    else:
+        if not user_data:
+            return {"savedGroups": [], "folders": [], "error": "Chrome profile not found"}
+        dirs = _profile_dirs(user_data)
 
     groups = {}
     tabs = []
 
-    for leveldb_dir in _profile_dirs(user_data):
+    for leveldb_dir in dirs:
         for value in _read_entities(leveldb_dir):
             spec = _decode(value).get(2)
             if not isinstance(spec, dict):

@@ -18,6 +18,7 @@ let state = {
   inboxGroups: [],
   inboxFilter: "",
   inboxPage: 0,
+  cleanupFilter: "",
 };
 
 let modalContext = null;
@@ -113,27 +114,41 @@ function switchView(view) {
     renderTree();
   } else if (view === "cleanup") {
     renderCleanup();
+  } else if (view === "overview") {
+    renderOverviewStats();
   }
 }
 
 function normalizeText(str) {
   return String(str)
-    .replace(/İ/g, "i").replace(/I/g, "i").replace(/ı/g, "i")
-    .replace(/Ğ/g, "g").replace(/ğ/g, "g")
-    .replace(/Ü/g, "u").replace(/ü/g, "u")
-    .replace(/Ş/g, "s").replace(/ş/g, "s")
-    .replace(/Ö/g, "o").replace(/ö/g, "o")
-    .replace(/Ç/g, "c").replace(/ç/g, "c")
+    // Turkish dotless-i has no NFD decomposition — must be explicit
+    .replace(/İ/g, "i").replace(/ı/g, "i")
+    // NFD strips all other diacritics: ç→c, ü→u, é→e, ñ→n, Ö→O→o …
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
     .toLowerCase();
 }
 
 function render() {
+  renderOverviewStats();
   const view = state.activeView;
   if (view === "workspace" || document.getElementById("view-workspace")?.classList.contains("active")) {
     renderTree();
   } else if (view === "cleanup") {
     renderCleanup();
   }
+}
+
+function renderOverviewStats() {
+  const total    = state.savedGroups.length;
+  const active   = state.savedGroups.filter((g) => g.active).length;
+  const inbox    = state.inboxGroups.length;
+  const folders  = state.folders.length;
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = String(v); };
+  set("stat-total",   total);
+  set("stat-active",  active);
+  set("stat-inbox",   inbox);
+  set("stat-folders", folders);
 }
 
 function isRootParent(parentId) {
@@ -570,10 +585,13 @@ function renderCleanupUnnamed() {
   const badge = document.getElementById("cleanup-unnamed-badge");
   if (!container) return;
 
+  const q = normalizeText(state.cleanupFilter || "");
   const groups = state.savedGroups.filter((g) => {
     if (g.active) return false;
     const t = (g.title || "").trim();
-    return t.length <= 1 || (g.tabCount || 0) === 0;
+    const isUnnamed = t.length <= 1 || (g.tabCount || 0) === 0;
+    if (!isUnnamed) return false;
+    return q ? normalizeText(t || "unnamed").includes(q) : true;
   });
 
   if (badge) badge.textContent = String(groups.length);
@@ -627,7 +645,11 @@ function renderCleanupDuplicates() {
     byTitle.get(key).push(g);
   }
 
-  const dupSets = [...byTitle.values()].filter((arr) => arr.length > 1);
+  const q = normalizeText(state.cleanupFilter || "");
+  const dupSets = [...byTitle.values()].filter((arr) => {
+    if (arr.length <= 1) return false;
+    return q ? normalizeText(arr[0].title || "").includes(q) : true;
+  });
   if (badge) badge.textContent = String(dupSets.length);
 
   if (!dupSets.length) {
@@ -892,6 +914,11 @@ function bindListeners() {
 
   document.getElementById("cleanup-deselect-all")?.addEventListener("click", () => {
     document.querySelectorAll(".cleanup-check").forEach((cb) => { cb.checked = false; });
+  });
+
+  document.getElementById("cleanup-search")?.addEventListener("input", (e) => {
+    state.cleanupFilter = e.target.value;
+    renderCleanup();
   });
 
   document.getElementById("btn-refresh-workspace")?.addEventListener("click", refreshWorkspace);
