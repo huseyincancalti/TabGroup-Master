@@ -837,6 +837,39 @@ body {
   text-overflow: ellipsis;
 }
 
+/* Clickable tab links */
+.tree-tab-link {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  min-width: 0;
+  max-width: 100%;
+  transition: color var(--transition);
+}
+.tree-tab-link:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.tree-tab-favicon {
+  width: 13px; height: 13px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  object-fit: contain;
+}
+.tree-tab-favicon-placeholder {
+  width: 13px; height: 13px;
+  border-radius: 2px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.tree-tab-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  min-width: 0;
+}
+
 .tree-group {
   flex-wrap: wrap;
 }
@@ -1468,6 +1501,19 @@ body {
   font-style: italic;
   padding: 4px 0;
 }
+/* URL path hint shown next to tab title (both workspace and cleanup) */
+.cleanup-tab-domain {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-left: 5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+  flex-shrink: 1;
+  opacity: 0.75;
+}
+.tree-tab-link:hover .cleanup-tab-domain { opacity: 1; color: var(--accent); }
 
 /* ── Diagnostics ── */
 .diag-info { margin-bottom: 14px; }

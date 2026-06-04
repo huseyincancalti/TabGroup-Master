@@ -2,14 +2,15 @@
   "manifest_version": 3,
   "name": "TabGroup Master",
   "version": "2.0.0",
-  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzDftIlUqwbwYuuxiCbOwzJQfHCnB1ptWUUJdspmNNDYPm+zqHpCuH61mbto1h3e6mQ6Rj0zTXgzMQGIDu39gWAqNlmPdzFT14N5XMCKXfopEFd5i+E74agT7b16Qu16fE7gVwYpwLtdb5df9qvYx13lylP5/uo51h9QwmDXJM0ulrowIu53qTwoOXX9UWYkNpFz3VMTkjZa4nPSrZJoW12/MqmKUYumUgCPWQgGPJ8YrmW3zjPvJ1AagwuDsTNFq9/HU/i/uViYrd79wKtPD0/FwdG67SN0XvwhwHG/Xrm8NaFLxze4BmjnnTGPN7upEoqZeq/+RweZfDCr48sUE3wIDAQAB",
+  "key": "pgIwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDfkaSrwC/auwKE3XK9fhVC6cUF7CKqfyqAdbdKBScd+BLYb7hWJOFtnQsnCVtFBX5YjlwGZYRg8/THSFLhA8BNLCRtkm25T9HNmdA/pM17NCYUwZLkFQQJAm+/cAIjrREYbSQ7B/D3lcj0Ud7BOomZnQb6t5c/BerwTfH6J39dR9+UafTPAPBatblCD7Z1t01DbdVT7XFBY6TlX4UMeBuFq78ppJJ60KyXFsrZ21jvBK0reiyMaW/a2FRI5UG2T7EooyTQFnDzeZSFfQtygtMOdrCsx66Tnsl7aqK0V9jmEmScsg20/VAQc9RM+03lROJKhCAMlt6aHzvTMIOul2hVAgMBAAESgAJ2OpDCJBPNTLKuXEW8q6KMlil2nzPoMzjsGOHp3TTZB5NQ3bT1FkSUwPMxTnq3cL7nJkFLI2sEkjDoRFBwp0WfkBTghzRTSpO0fZxBrm/+cisFGVGC5r69bY3I3OpuOrcZk1ZGg+Fq8+g8LwcOk1n4XZiZVvZS/+ebwU8Z6mFotV4MYsHMEYHby9wFmAyGaoCo1VQNjBSpTgsH5HGS9u3imsfq3F+BuLpWIJoqxJcPgDbHOp5/6LgJ8+MjIcL7ddz+RPuXOBU/40FgfPYbfAnwjJ/a4KXOOZvJqcrmABvsNRpnx2782WynzIm6h2yEe4lxvN9W57KTffvAexbgHF7mgvEEEgoQ537fY7GDDqxtaWn15v0o0lBLAwQ=",
   "description": "Capture, organize, and restore your Chrome tab groups with nested folders and JSON backup.",
   "permissions": [
     "tabGroups",
     "tabs",
     "sidePanel",
     "storage",
-    "nativeMessaging"
+    "nativeMessaging",
+    "alarms"
   ],
   "background": {
     "service_worker": "background.js"

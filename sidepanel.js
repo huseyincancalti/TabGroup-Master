@@ -40,23 +40,42 @@ chrome.runtime.onMessage.addListener(async (message) => {
     await loadData();
     render();
     showToast(`♻️ Restored ${message.groupCount} groups from sync backup`, "info");
+  } else if (message.type === "RESTORED_FROM_BACKUP") {
+    await loadData();
+    render();
+    showToast(
+      `✅ Data restored! ${message.groupCount} groups + ${message.folderCount} folders recovered from local backup.`,
+      "success"
+    );
   }
 });
 
 function sendMsg(message) {
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage(message, (response) => {
-      if (chrome.runtime.lastError) {
-        resolve(null);
-        return;
-      }
-      resolve(response);
-    });
+    let attempts = 0;
+    const attempt = () => {
+      chrome.runtime.sendMessage(message, (response) => {
+        if (chrome.runtime.lastError) {
+          if (++attempts < 3) { setTimeout(attempt, 400); }
+          else { resolve(null); }
+          return;
+        }
+        resolve(response);
+      });
+    };
+    attempt();
   });
 }
 
 async function loadData() {
-  const store = await sendMsg({ action: "getStore" });
+  let store = await sendMsg({ action: "getStore" });
+  if (!store) {
+    // SW unresponsive — read directly from chrome.storage.local
+    try {
+      const raw = await chrome.storage.local.get(["savedGroups", "folders"]);
+      store = { savedGroups: raw.savedGroups || [], folders: raw.folders || [] };
+    } catch (_) { return; }
+  }
   if (!store) return;
   state.savedGroups = store.savedGroups || [];
   state.folders = store.folders || [];

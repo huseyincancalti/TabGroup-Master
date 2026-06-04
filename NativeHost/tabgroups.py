@@ -7,6 +7,33 @@ import time
 
 import leveldb_reader as L
 
+# ── AppData file backup ───────────────────────────────────────────────────────
+# Stored outside the Chrome profile so it survives profile resets.
+_BACKUP_DIR  = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TabGroupMaster")
+_BACKUP_FILE = os.path.join(_BACKUP_DIR, "workspace_backup.json")
+
+
+def save_backup(data: dict) -> bool:
+    """Persist the full workspace to LOCALAPPDATA. Survives Chrome profile wipes."""
+    try:
+        os.makedirs(_BACKUP_DIR, exist_ok=True)
+        tmp = _BACKUP_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, _BACKUP_FILE)   # atomic write
+        return True
+    except Exception:
+        return False
+
+
+def load_backup() -> dict | None:
+    """Read workspace backup from LOCALAPPDATA. Returns None if not found."""
+    try:
+        with open(_BACKUP_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
 COLOR_NAMES = {
     0: "grey", 1: "grey", 2: "blue", 3: "red", 4: "yellow",
     5: "green", 6: "pink", 7: "purple", 8: "cyan", 9: "orange",

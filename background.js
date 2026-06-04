@@ -62,6 +62,59 @@ async function getStore() {
 async function setStore(partial) {
   await chrome.storage.local.set(partial);
   scheduleSyncBackup();
+  scheduleFileBackup();
+}
+
+// ── File backup via NativeHost ────────────────────────────────────────────────
+// Written to %LOCALAPPDATA%\TabGroupMaster\workspace_backup.json — SURVIVES
+// Chrome profile resets because AppData is outside Chrome's profile directory.
+
+let _fileBackupTimer = null;
+
+function scheduleFileBackup() {
+  clearTimeout(_fileBackupTimer);
+  _fileBackupTimer = setTimeout(doFileBackup, 30_000); // 30-second debounce
+}
+
+async function doFileBackup() {
+  try {
+    const store = await getStore();
+    const payload = { v: 4, ts: Date.now(), savedGroups: store.savedGroups, folders: store.folders };
+    await _nativeOneShot("saveBackup", { data: payload }, "saveBackupResult", 8_000);
+  } catch (_) {}
+}
+
+async function restoreFromFileBackup() {
+  try {
+    const local = await chrome.storage.local.get(["savedGroups", "folders"]);
+    if ((local.savedGroups || []).length > 0 || (local.folders || []).length > 0) return;
+    const msg = await _nativeOneShot("loadBackup", {}, "loadBackupResult", 10_000);
+    if (!msg?.ok || !msg.data?.savedGroups?.length) return;
+    const savedGroups = (msg.data.savedGroups || []).map(normalizeGroup);
+    const folders     = (msg.data.folders     || []).map(normalizeFolder);
+    await chrome.storage.local.set({ savedGroups, folders });
+    broadcast({ type: "RESTORED_FROM_BACKUP", groupCount: savedGroups.length, folderCount: folders.length });
+  } catch (_) {}
+}
+
+/** Open a native port, send one message, wait for one response, then disconnect. */
+function _nativeOneShot(action, extra, expectedAction, timeoutMs) {
+  return new Promise((resolve) => {
+    let port;
+    try { port = chrome.runtime.connectNative(NATIVE_HOST_NAME); } catch (_) { resolve(null); return; }
+    if (!port) { resolve(null); return; }
+    let done = false;
+    const finish = (v) => {
+      if (done) return; done = true;
+      clearTimeout(t);
+      try { port.disconnect(); } catch (_) {}
+      resolve(v);
+    };
+    const t = setTimeout(() => finish(null), timeoutMs);
+    port.onDisconnect.addListener(() => finish(null));
+    port.onMessage.addListener((m) => { if (m?.action === expectedAction) finish(m); });
+    port.postMessage({ action, ...extra });
+  });
 }
 
 // ── Cloud backup ─────────────────────────────────────────────────────────────
@@ -353,6 +406,16 @@ async function importStore(data) {
   return { added };
 }
 
+// ── Service worker keepalive ──────────────────────────────────────────────────
+// MV3 service workers die after ~30s of inactivity. An alarm every minute
+// keeps the SW alive so the dashboard can always send messages to it.
+chrome.alarms.create("keepalive", { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "keepalive") {
+    /* just waking up is enough — do nothing */
+  }
+});
+
 chrome.tabGroups.onCreated.addListener(scheduleReconcile);
 chrome.tabGroups.onUpdated.addListener(scheduleReconcile);
 chrome.tabGroups.onRemoved.addListener(scheduleReconcile);
@@ -574,5 +637,7 @@ const handlers = {
   },
 };
 
-// On startup: restore from sync backup if local storage is empty, then reconcile live tabs.
-restoreFromCloud().then(() => reconcile());
+// On startup: try cloud sync backup first, then file backup, then reconcile.
+restoreFromCloud()
+  .then(() => restoreFromFileBackup())
+  .then(() => reconcile());

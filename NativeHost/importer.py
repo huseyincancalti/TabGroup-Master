@@ -39,6 +39,18 @@ def main():
                 send_message({"action": "extractResult", "ok": True, "data": data})
             except Exception as exc:
                 send_message({"action": "extractResult", "ok": False, "error": str(exc)})
+        elif action == "saveBackup":
+            try:
+                ok = tabgroups.save_backup(message.get("data") or {})
+                send_message({"action": "saveBackupResult", "ok": ok})
+            except Exception as exc:
+                send_message({"action": "saveBackupResult", "ok": False, "error": str(exc)})
+        elif action == "loadBackup":
+            try:
+                data = tabgroups.load_backup()
+                send_message({"action": "loadBackupResult", "ok": data is not None, "data": data})
+            except Exception as exc:
+                send_message({"action": "loadBackupResult", "ok": False, "data": None, "error": str(exc)})
 
 
 if __name__ == "__main__":

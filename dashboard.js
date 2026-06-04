@@ -5,7 +5,7 @@ const COLOR_HEX = {
   green: "#81c995", pink: "#f48fb1", purple: "#d7aefb", cyan: "#78d9ec", orange: "#fcad70",
 };
 
-const INBOX_PAGE_SIZE = 50;
+const INBOX_PAGE_SIZE = 200; // Show up to 200 groups before "Show more"
 
 let state = {
   savedGroups: [],
@@ -51,24 +51,46 @@ chrome.runtime.onMessage.addListener(async (message) => {
     await loadData();
     render();
     showToast(`♻️ Restored ${message.groupCount} groups + ${message.folderCount} folders from sync backup`, "info");
+  } else if (message.type === "RESTORED_FROM_BACKUP") {
+    await loadData();
+    render();
+    showToast(
+      `✅ Data restored! ${message.groupCount} groups + ${message.folderCount} folders recovered from local backup.`,
+      "success"
+    );
   }
 });
 
 function sendMsg(message) {
+  // Retry up to 3 times with 400 ms gaps — guards against SW wake-up latency
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage(message, (response) => {
-      if (chrome.runtime.lastError) {
-        resolve(null);
-        return;
-      }
-      resolve(response);
-    });
+    let attempts = 0;
+    const attempt = () => {
+      chrome.runtime.sendMessage(message, (response) => {
+        if (chrome.runtime.lastError) {
+          if (++attempts < 3) { setTimeout(attempt, 400); }
+          else { resolve(null); }
+          return;
+        }
+        resolve(response);
+      });
+    };
+    attempt();
   });
 }
 
 async function loadData() {
-  const store = await sendMsg({ action: "getStore" });
+  let store = await sendMsg({ action: "getStore" });
+
+  if (!store) {
+    // Service worker unresponsive — read directly from chrome.storage.local as fallback
+    try {
+      const raw = await chrome.storage.local.get(["savedGroups", "folders"]);
+      store = { savedGroups: raw.savedGroups || [], folders: raw.folders || [] };
+    } catch (_) { return; }
+  }
   if (!store) return;
+
   state.savedGroups = (store.savedGroups || []).map((g) => ({
     ...g,
     folderId: g.folderId ?? null,
@@ -142,7 +164,10 @@ function normalizeText(str) {
 function render() {
   renderOverviewStats();
   const view = state.activeView;
-  if (view === "workspace" || document.getElementById("view-workspace")?.classList.contains("active")) {
+  // Check both state flag AND actual DOM class (state can lag on first load)
+  const workspaceActive = view === "workspace"
+    || document.getElementById("view-workspace")?.classList.contains("active");
+  if (workspaceActive) {
     renderTree();
   } else if (view === "cleanup") {
     renderCleanup();
@@ -447,15 +472,65 @@ function buildGroupNode(group, options = {}) {
 
 function renderTreeTabsList(listEl, tabs) {
   listEl.innerHTML = "";
+  if (!tabs.length) {
+    listEl.innerHTML = '<li class="tree-group-tab-empty">No tabs stored — Restore to open in Chrome</li>';
+    return;
+  }
   const frag = document.createDocumentFragment();
   tabs.forEach((t) => {
     const li = document.createElement("li");
     li.className = "tree-group-tab-item";
-    li.textContent = t.title || t.url || "Untitled";
-    li.title = t.url || "";
+    const url = t.url || "";
+    const title = t.title || url || "Untitled";
+    const isLink = url && !url.startsWith("chrome://") && !url.startsWith("chrome-extension://");
+    if (isLink) {
+      const a = document.createElement("a");
+      a.href = url;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.title = url;
+      a.className = "tree-tab-link";
+      // Favicon
+      if (t.favIconUrl) {
+        const img = document.createElement("img");
+        img.src = t.favIconUrl;
+        img.className = "tree-tab-favicon";
+        img.alt = "";
+        img.onerror = () => img.replaceWith(makeFaviconPlaceholder());
+        a.appendChild(img);
+      } else {
+        a.appendChild(makeFaviconPlaceholder());
+      }
+      const span = document.createElement("span");
+      span.className = "tree-tab-title";
+      span.textContent = title;
+      a.appendChild(span);
+      // URL path hint — shows "youtube.com/watch?v=…" so generic titles are actionable
+      try {
+        const u = new URL(url);
+        const path = (u.hostname + u.pathname + u.search).replace(/^www\./, "");
+        const hint = path.length > 55 ? path.slice(0, 52) + "…" : path;
+        if (hint && hint.toLowerCase() !== title.toLowerCase().slice(0, hint.length)) {
+          const domSpan = document.createElement("span");
+          domSpan.className = "cleanup-tab-domain";
+          domSpan.textContent = hint;
+          a.appendChild(domSpan);
+        }
+      } catch (_) {}
+      li.appendChild(a);
+    } else {
+      li.textContent = title;
+      li.style.color = "var(--text-muted)";
+    }
     frag.appendChild(li);
   });
   listEl.appendChild(frag);
+}
+
+function makeFaviconPlaceholder() {
+  const sp = document.createElement("span");
+  sp.className = "tree-tab-favicon-placeholder";
+  return sp;
 }
 
 async function toggleTreeGroupTabs(node, group) {
@@ -618,15 +693,66 @@ async function toggleCleanupTabs(listEl, group) {
 
 function _renderCleanupTabsList(listEl, tabs) {
   listEl.innerHTML = "";
-  if (!tabs.length) { listEl.innerHTML = '<li class="cleanup-tab-empty">No tabs stored — re-import from Chrome to populate</li>'; return; }
+  if (!tabs.length) {
+    const li = document.createElement("li");
+    li.className = "cleanup-tab-empty";
+    li.textContent = "No tabs stored — re-import from Chrome to populate";
+    listEl.appendChild(li);
+    return;
+  }
   const frag = document.createDocumentFragment();
   tabs.forEach((t) => {
     const li = document.createElement("li");
     li.className = "cleanup-tab-item";
-    const favicon = t.favIconUrl
-      ? `<img class="cleanup-tab-favicon" src="${escHtml(t.favIconUrl)}" alt="" />`
-      : '<span class="cleanup-tab-favicon-placeholder"></span>';
-    li.innerHTML = `${favicon}<span class="cleanup-tab-text" title="${escHtml(t.url || "")}">${escHtml(t.title || t.url || "Untitled")}</span>`;
+    const url = t.url || "";
+    const title = t.title || url || "Untitled";
+    const isLink = url && !url.startsWith("chrome://") && !url.startsWith("chrome-extension://");
+
+    if (isLink) {
+      const a = document.createElement("a");
+      a.href = url;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.title = url;              // full URL shown on hover
+      a.className = "tree-tab-link";  // reuse workspace styles
+
+      // Favicon
+      if (t.favIconUrl) {
+        const img = document.createElement("img");
+        img.src = t.favIconUrl;
+        img.className = "tree-tab-favicon";
+        img.alt = "";
+        img.onerror = () => img.replaceWith(makeFaviconPlaceholder());
+        a.appendChild(img);
+      } else {
+        a.appendChild(makeFaviconPlaceholder());
+      }
+
+      // Title
+      const titleSpan = document.createElement("span");
+      titleSpan.className = "tree-tab-title";
+      titleSpan.textContent = title;
+      a.appendChild(titleSpan);
+
+      // URL path hint — e.g. "youtube.com/watch?v=abc123" tells you WHICH YouTube page
+      try {
+        const u = new URL(url);
+        const path = (u.hostname + u.pathname + u.search).replace(/^www\./, "");
+        const hint = path.length > 64 ? path.slice(0, 61) + "…" : path;
+        if (hint && hint.toLowerCase() !== title.toLowerCase().slice(0, hint.length)) {
+          const domSpan = document.createElement("span");
+          domSpan.className = "cleanup-tab-domain";
+          domSpan.textContent = hint;
+          a.appendChild(domSpan);
+        }
+      } catch (_) { /* ignore bad URLs */ }
+
+      li.appendChild(a);
+    } else {
+      // Non-navigable (chrome:// etc.) — plain text
+      li.textContent = title;
+      li.style.color = "var(--text-muted)";
+    }
     frag.appendChild(li);
   });
   listEl.appendChild(frag);
@@ -929,7 +1055,10 @@ async function confirmCreateFolder() {
 
 async function refreshWorkspace() {
   await loadData();
-  render();
+  // Always re-render the workspace tree directly — don't go through render()
+  // which may bail out if state.activeView hasn't been set yet.
+  renderTree();
+  renderOverviewStats();
   showToast("Workspace refreshed", "success");
 }
 
@@ -1061,6 +1190,10 @@ function bindListeners() {
 
 async function exportToJson() {
   await loadData();
+  if (!state.savedGroups.length && !state.folders.length) {
+    showToast("Nothing to export — data may still be loading, try again", "info");
+    return;
+  }
   const payload = {
     exportedAt: new Date().toISOString(),
     app: "TabGroup Master",
