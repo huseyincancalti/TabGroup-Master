@@ -1,8 +1,21 @@
 import sys
+import os
 import json
 import struct
 
 import tabgroups
+
+# ── CRITICAL (Windows): put stdin/stdout into BINARY mode ──────────────────────
+# Native messaging is a raw binary protocol (4-byte little-endian length + JSON).
+# On Windows, stdout defaults to TEXT mode, which silently rewrites every 0x0A
+# (\n) byte to 0x0D 0x0A (\r\n). That corrupts both the length header and any
+# newline byte inside the JSON, so Chrome immediately drops the connection —
+# which looks like "native host not found / disconnected" even though the .bat
+# ran fine. Forcing binary mode is the fix.
+if sys.platform == "win32":
+    import msvcrt
+    msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+    msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
 
 
 def read_message():

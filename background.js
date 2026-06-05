@@ -37,6 +37,7 @@ function normalizeGroup(group) {
     tabsLoaded: group.tabsLoaded ?? tabs.length > 0,
     active: group.active === true,
     chromeGroupId: group.chromeGroupId ?? null,
+    openWindowId: group.openWindowId ?? null,
     folderId: group.folderId ?? null,
     savedAt: group.savedAt || Date.now(),
   };
@@ -57,6 +58,35 @@ async function getStore() {
     savedGroups: (data.savedGroups || []).map(normalizeGroup),
     folders: (data.folders || []).map(normalizeFolder),
   };
+}
+
+// ── User settings ──────────────────────────────────────────────────────────────
+const SETTINGS_KEY = "settings";
+const DEFAULT_SETTINGS = {
+  lazyRestore: true, // open saved groups as frozen tabs (huge RAM saver)
+  freeMode: true,    // open groups in their own window, NOT as Chrome tab groups
+                     // → nothing ever lands in Chrome's saved-groups / bookmarks bar
+};
+
+async function getSettings() {
+  const data = await chrome.storage.local.get(SETTINGS_KEY);
+  return { ...DEFAULT_SETTINGS, ...(data[SETTINGS_KEY] || {}) };
+}
+
+async function setSettings(partial) {
+  const next = { ...(await getSettings()), ...(partial || {}) };
+  await chrome.storage.local.set({ [SETTINGS_KEY]: next });
+  return next;
+}
+
+/** Build a frozen-tab URL that holds a real URL without loading it. */
+function buildSuspendedUrl(tab) {
+  const qs = new URLSearchParams({
+    u: tab.url || "",
+    t: tab.title || tab.url || "",
+    f: tab.favIconUrl || "",
+  });
+  return `${chrome.runtime.getURL("suspended.html")}?${qs.toString()}`;
 }
 
 async function setStore(partial) {
@@ -260,10 +290,21 @@ async function reconcileInner() {
   const store = await getStore();
   const live = await snapshotLiveGroups();
   const liveIds = new Set(live.map((g) => g.chromeGroupId));
+  const liveWindowIds = new Set((await chrome.windows.getAll()).map((w) => w.id));
   const groups = store.savedGroups;
 
   for (const g of groups) {
-    if (g.active && !liveIds.has(g.chromeGroupId)) {
+    if (!g.active) continue;
+    // Free-mode groups live in their own window: active iff that window exists.
+    if (g.openWindowId != null) {
+      if (!liveWindowIds.has(g.openWindowId)) {
+        g.active = false;
+        g.openWindowId = null;
+      }
+      continue; // never treat window-based groups as Chrome tab groups
+    }
+    // Legacy Chrome-tab-group: active iff the group still exists in the strip.
+    if (!liveIds.has(g.chromeGroupId)) {
       g.active = false;
       g.chromeGroupId = null;
     }
@@ -416,6 +457,23 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
+// When a free-mode window is closed, mark its group inactive immediately.
+chrome.windows.onRemoved.addListener(async (windowId) => {
+  const store = await getStore();
+  let changed = false;
+  for (const g of store.savedGroups) {
+    if (g.openWindowId === windowId) {
+      g.active = false;
+      g.openWindowId = null;
+      changed = true;
+    }
+  }
+  if (changed) {
+    await setStore({ savedGroups: store.savedGroups });
+    broadcast({ type: "STORE_UPDATED" });
+  }
+});
+
 chrome.tabGroups.onCreated.addListener(scheduleReconcile);
 chrome.tabGroups.onUpdated.addListener(scheduleReconcile);
 chrome.tabGroups.onRemoved.addListener(scheduleReconcile);
@@ -460,29 +518,100 @@ const handlers = {
     return { ok: true, tabs: group.tabs || [] };
   },
 
-  async restoreGroup({ groupUid }) {
+  async restoreGroup({ groupUid, lazy }) {
     const store = await getStore();
     const group = buildIndexes(store).groupsByUid.get(groupUid);
-    if (!group || group.active) return { ok: false };
+    if (!group) return { ok: false };
     if (!group.tabs?.length) return { ok: false, error: "No tabs stored for this group" };
 
+    const settings = await getSettings();
+    const useLazy = lazy === undefined ? settings.lazyRestore !== false : !!lazy;
+    const freeMode = settings.freeMode !== false;
+
+    // If it's already open, just focus it instead of opening twice.
+    if (group.active) {
+      if (group.openWindowId != null) {
+        try { await chrome.windows.update(group.openWindowId, { focused: true }); return { ok: true, focused: true }; }
+        catch (_) { /* window gone — fall through and reopen */ }
+      }
+      return { ok: false, error: "Group is already open" };
+    }
+
+    const urls = group.tabs
+      .filter(t => t.url && !t.url.startsWith("chrome://") && !t.url.startsWith("edge://"))
+      .map(t => (useLazy ? buildSuspendedUrl(t) : t.url));
+    if (urls.length === 0) return { ok: false, error: "No restorable tabs" };
+
+    if (freeMode) {
+      // ── FREE MODE: own window, no Chrome tab group ──────────────────────────
+      // Chrome never creates a "saved tab group", so nothing pollutes the
+      // bookmarks bar. The group lives entirely inside TabGroup Master.
+      const win = await chrome.windows.create({ url: urls, focused: true });
+      group.active = true;
+      group.openWindowId = win.id;
+      group.chromeGroupId = null;
+      await setStore({ savedGroups: store.savedGroups });
+      broadcast({ type: "STORE_UPDATED" });
+      return { ok: true, freeMode: true, lazy: useLazy, count: urls.length, windowId: win.id };
+    }
+
+    // ── LEGACY MODE: native Chrome tab group in the current window ─────────────
     const window = await chrome.windows.getCurrent();
     const tabIds = [];
-    for (const tab of group.tabs) {
-      if (!tab.url || tab.url.startsWith("chrome://")) continue;
-      const created = await chrome.tabs.create({ url: tab.url, windowId: window.id, active: false });
+    for (const url of urls) {
+      const created = await chrome.tabs.create({ url, windowId: window.id, active: false });
       tabIds.push(created.id);
     }
-    if (tabIds.length === 0) return { ok: false, error: "No restorable tabs" };
-
     const chromeGroupId = await chrome.tabs.group({ tabIds, createProperties: { windowId: window.id } });
     await chrome.tabGroups.update(chromeGroupId, { title: group.title, color: group.color });
-
     group.active = true;
     group.chromeGroupId = chromeGroupId;
+    group.openWindowId = null;
     await setStore({ savedGroups: store.savedGroups });
     await reconcile();
+    return { ok: true, freeMode: false, lazy: useLazy, count: tabIds.length };
+  },
+
+  // ── Close an open group (close its window or ungroup), keep it saved ─────────
+  async closeGroup({ groupUid }) {
+    const store = await getStore();
+    const group = buildIndexes(store).groupsByUid.get(groupUid);
+    if (!group) return { ok: false };
+
+    if (group.openWindowId != null) {
+      try { await chrome.windows.remove(group.openWindowId); } catch (_) {}
+    } else if (group.chromeGroupId != null) {
+      try {
+        const tabs = await chrome.tabs.query({ groupId: group.chromeGroupId });
+        const ids = tabs.map(t => t.id).filter(Boolean);
+        if (ids.length) await chrome.tabs.remove(ids);
+      } catch (_) {}
+    }
+    group.active = false;
+    group.openWindowId = null;
+    group.chromeGroupId = null;
+    await setStore({ savedGroups: store.savedGroups });
+    broadcast({ type: "STORE_UPDATED" });
     return { ok: true };
+  },
+
+  // ── Bring an open group's window to the front ────────────────────────────────
+  async focusGroupWindow({ groupUid }) {
+    const store = await getStore();
+    const group = buildIndexes(store).groupsByUid.get(groupUid);
+    if (!group) return { ok: false };
+    if (group.openWindowId != null) {
+      try { await chrome.windows.update(group.openWindowId, { focused: true }); return { ok: true }; }
+      catch (_) { return { ok: false }; }
+    }
+    if (group.chromeGroupId != null) {
+      try {
+        const g = await chrome.tabGroups.get(group.chromeGroupId);
+        await chrome.windows.update(g.windowId, { focused: true });
+        return { ok: true };
+      } catch (_) {}
+    }
+    return { ok: false };
   },
 
   async deleteGroup({ groupUid }) {
@@ -634,6 +763,79 @@ const handlers = {
     if (!data || typeof data !== "object") return { ok: false, error: "Invalid backup file" };
     const res = await importStore(data);
     return { ok: true, added: res.added };
+  },
+
+  // ── Create a brand-new group (from scratch, no open Chrome tabs needed) ──────
+  async createGroup({ title, color, tabs }) {
+    const store = await getStore();
+    const newGroup = normalizeGroup({
+      title: (title || "").trim() || "New Group",
+      color: color || "grey",
+      tabs: (tabs || [])
+        .map(t => ({ url: (t.url || "").trim(), title: (t.title || t.url || "").trim() }))
+        .filter(t => t.url),
+      active: false,
+      chromeGroupId: null,
+      folderId: null,
+      savedAt: Date.now(),
+    });
+    store.savedGroups.push(newGroup);
+    await setStore({ savedGroups: store.savedGroups });
+    broadcast({ type: "STORE_UPDATED" });
+    return { ok: true, group: newGroup };
+  },
+
+  // ── Replace the tab list for an existing saved group ─────────────────────────
+  async updateGroupTabs({ groupUid, tabs }) {
+    const store = await getStore();
+    const group = buildIndexes(store).groupsByUid.get(groupUid);
+    if (!group) return { ok: false };
+    group.tabs = (tabs || [])
+      .map(t => ({ url: (t.url || "").trim(), title: (t.title || t.url || "").trim() }))
+      .filter(t => t.url);
+    group.tabCount = group.tabs.length;
+    group.tabsLoaded = true;
+    await setStore({ savedGroups: store.savedGroups });
+    broadcast({ type: "STORE_UPDATED" });
+    return { ok: true };
+  },
+
+  // ── Persist a user-defined ordering for savedGroups (drag-and-drop) ──────────
+  async reorderGroups({ orderedUids }) {
+    if (!Array.isArray(orderedUids)) return { ok: false };
+    const store = await getStore();
+    const byUid = new Map(store.savedGroups.map(g => [g.uid, g]));
+    const reordered = orderedUids.map(u => byUid.get(u)).filter(Boolean);
+    const reorderedSet = new Set(orderedUids);
+    const rest = store.savedGroups.filter(g => !reorderedSet.has(g.uid));
+    await setStore({ savedGroups: [...reordered, ...rest] });
+    broadcast({ type: "STORE_UPDATED" });
+    return { ok: true };
+  },
+
+  async getSettings() {
+    return { ok: true, settings: await getSettings() };
+  },
+
+  async updateSettings({ settings }) {
+    return { ok: true, settings: await setSettings(settings || {}) };
+  },
+
+  // ── Remove all active Chrome tab groups (tabs stay open, just ungrouped) ─────
+  async closeAllChromeGroups() {
+    try {
+      const groups = await chrome.tabGroups.query({});
+      let count = 0;
+      for (const g of groups) {
+        const tabs = await chrome.tabs.query({ groupId: g.id });
+        const tabIds = tabs.map(t => t.id).filter(Boolean);
+        if (tabIds.length) { await chrome.tabs.ungroup(tabIds).catch(() => {}); count++; }
+      }
+      await reconcile();
+      return { ok: true, count };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
   },
 };
 

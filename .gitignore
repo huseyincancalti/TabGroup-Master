@@ -1,0 +1,19 @@
+# ── Machine-generated files (paths are local, not portable) ────────────────
+NativeHost/run_host.bat
+NativeHost/com.tabgroup.master.json
+NativeHost/update_manifest.xml
+NativeHost/chrome_policy.reg
+
+# ── Sensitive / binary ──────────────────────────────────────────────────────
+NativeHost/extension.pem
+NativeHost/extension.crx
+
+# ── Python cache ────────────────────────────────────────────────────────────
+__pycache__/
+NativeHost/__pycache__/
+*.pyc
+*.pyo
+
+# ── OS noise ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

@@ -360,6 +360,10 @@ body {
 .group-actions button svg { width: 14px; height: 14px; }
 .group-actions button:hover { color: var(--text-primary); background: var(--bg-active); }
 .group-actions .delete-btn:hover { color: var(--group-red) !important; }
+.group-actions .close-group-btn:hover { color: var(--group-orange) !important; }
+
+/* Active group card body is clickable → focuses its window */
+#pane-active .group-info { cursor: pointer; }
 
 .group-tabs-list {
   list-style: none;
@@ -452,6 +456,8 @@ body {
   padding: 24px;
   width: 100%;
   max-width: 320px;
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
   box-shadow: var(--shadow), var(--shadow-glow);
   animation: slideUp 320ms cubic-bezier(0.22, 1, 0.36, 1);
 }
@@ -665,6 +671,151 @@ body {
 .toast-success { background: rgba(129, 201, 149, 0.18); border-color: rgba(129, 201, 149, 0.45); color: #b8e6c8; }
 .toast-error { background: rgba(242, 139, 130, 0.18); border-color: rgba(242, 139, 130, 0.45); color: #f5b8b3; }
 .toast-info { background: rgba(138, 180, 248, 0.18); border-color: rgba(138, 180, 248, 0.45); color: #c5d9fc; }
+
+/* ─── New Group button (green accent) ─── */
+.btn-macro-new {
+  background: linear-gradient(135deg, rgba(129, 201, 149, 0.22), rgba(78, 179, 111, 0.16)) !important;
+  border-color: rgba(129, 201, 149, 0.45) !important;
+  color: #81c995 !important;
+}
+.btn-macro-new:hover {
+  background: linear-gradient(135deg, rgba(129, 201, 149, 0.32), rgba(78, 179, 111, 0.24)) !important;
+  border-color: #81c995 !important;
+  box-shadow: 0 8px 32px rgba(129, 201, 149, 0.18), var(--shadow) !important;
+}
+
+/* ─── Danger toolbar strip ─── */
+#toolbar-danger {
+  display: flex;
+  padding: 4px 16px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.btn-danger-outline {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 7px 12px;
+  background: transparent;
+  border: 1px solid rgba(242, 139, 130, 0.28);
+  border-radius: var(--radius-sm);
+  color: #f28b82;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition), border-color var(--transition), color var(--transition);
+}
+.btn-danger-outline svg { width: 13px; height: 13px; flex-shrink: 0; }
+.btn-danger-outline:hover {
+  background: rgba(242, 139, 130, 0.1);
+  border-color: rgba(242, 139, 130, 0.6);
+  color: #ffb4ae;
+}
+
+/* ─── Edit modal — tab list ─── */
+.edit-tabs-badge {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.edit-tab-list {
+  max-height: 160px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-tertiary);
+  margin-bottom: 8px;
+  padding: 4px 0;
+}
+.edit-tab-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 4px;
+  transition: background var(--transition);
+}
+.edit-tab-row:hover { background: var(--bg-hover); }
+.edit-tab-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+}
+.edit-tab-url {
+  flex: 1;
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.edit-tab-remove {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 3px;
+  line-height: 1;
+  transition: color var(--transition), background var(--transition);
+}
+.edit-tab-remove:hover { color: #f28b82; background: rgba(242,139,130,0.12); }
+.edit-tab-empty {
+  padding: 12px 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+}
+.add-tab-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+.add-tab-row input {
+  flex: 1;
+  padding: 7px 10px !important;
+  margin-bottom: 0 !important;
+  font-size: 12px !important;
+}
+.btn-add-tab {
+  flex-shrink: 0;
+  padding: 7px 11px;
+  background: var(--accent-dim);
+  border: 1px solid rgba(138, 180, 248, 0.3);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--transition), border-color var(--transition);
+}
+.btn-add-tab:hover { background: rgba(138,180,248,0.22); border-color: var(--accent); }
+
+/* ─── Drag-and-drop ─── */
+.drag-handle {
+  flex-shrink: 0;
+  font-size: 14px;
+  color: var(--text-muted);
+  cursor: grab;
+  padding: 0 2px;
+  opacity: 0;
+  transition: opacity var(--transition);
+  user-select: none;
+  line-height: 1;
+}
+.group-card:hover .drag-handle { opacity: 0.55; }
+.group-card.dragging { opacity: 0.4; box-shadow: none; }
+.group-card.drag-over {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 2px var(--accent-dim), inset 0 0 0 1px var(--accent);
+}
 
 /* ─── Utility ─── */
 .hidden { display: none !important; }

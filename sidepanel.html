@@ -53,6 +53,20 @@
       </svg>
       <span>Import from Chrome</span>
     </button>
+    <button id="btn-new-group" class="btn-macro btn-macro-new" type="button" title="Create a new group from scratch">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/>
+      </svg>
+      <span>New Group</span>
+    </button>
+  </div>
+  <div id="toolbar-danger">
+    <button id="btn-close-chrome-groups" class="btn-danger-outline" type="button" title="Ungroup all Chrome tab groups — tabs stay open">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/>
+      </svg>
+      <span>Clear All Chrome Groups</span>
+    </button>
   </div>
 
   <div id="tab-bar">
@@ -84,7 +98,7 @@
     </section>
 
     <section id="pane-saved" class="pane hidden">
-      <p class="pane-hint">Unorganized saved groups. Drag into folders from the Dashboard Workspace.</p>
+      <p class="pane-hint">Saved groups — drag to reorder, or open Dashboard to organize into folders.</p>
       <div id="saved-groups-list" class="groups-container"></div>
       <div id="empty-saved" class="empty-state hidden">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -110,11 +124,17 @@
 
   <div id="edit-modal-overlay" class="hidden">
     <div id="edit-modal" class="glass-modal">
-      <h3>Edit Group</h3>
+      <h3 id="edit-modal-heading">Edit Group</h3>
       <label for="edit-group-title">Name</label>
       <input type="text" id="edit-group-title" autocomplete="off" spellcheck="false"/>
       <label>Color</label>
       <div id="edit-color-picker"></div>
+      <label>Tabs <span id="edit-tabs-badge" class="edit-tabs-badge"></span></label>
+      <div id="edit-tab-list" class="edit-tab-list"></div>
+      <div class="add-tab-row">
+        <input type="url" id="new-tab-url" placeholder="https://example.com" autocomplete="off" spellcheck="false"/>
+        <button id="add-tab-btn" type="button" class="btn-add-tab">+ Add</button>
+      </div>
       <div id="edit-modal-actions">
         <button id="edit-modal-cancel" class="btn-secondary" type="button">Cancel</button>
         <button id="edit-modal-confirm" class="btn-primary" type="button">Save</button>

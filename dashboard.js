@@ -31,8 +31,18 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   await loadData();
   bindListeners();
+  await loadSettings();
   render();
 });
+
+async function loadSettings() {
+  const res = await sendMsg({ action: "getSettings" });
+  const s = res?.settings || {};
+  const lazyEl = document.getElementById("toggle-lazy-restore");
+  const freeEl = document.getElementById("toggle-free-mode");
+  if (lazyEl) lazyEl.checked = s.lazyRestore !== false;
+  if (freeEl) freeEl.checked = s.freeMode !== false;
+}
 
 chrome.storage.onChanged.addListener(async (changes, area) => {
   if (area !== "local") return;
@@ -1097,6 +1107,26 @@ function bindListeners() {
   document.getElementById("dash-folder-name")?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") confirmCreateFolder();
     if (e.key === "Escape") closeFolderModal();
+  });
+
+  document.getElementById("toggle-lazy-restore")?.addEventListener("change", async (e) => {
+    const lazyRestore = e.target.checked;
+    await sendMsg({ action: "updateSettings", settings: { lazyRestore } });
+    showToast(
+      lazyRestore ? "Frozen-tab loading enabled" : "Tabs will now load immediately",
+      "success"
+    );
+  });
+
+  document.getElementById("toggle-free-mode")?.addEventListener("change", async (e) => {
+    const freeMode = e.target.checked;
+    await sendMsg({ action: "updateSettings", settings: { freeMode } });
+    showToast(
+      freeMode
+        ? "Groups now open in their own window — nothing goes to Chrome's bookmarks bar"
+        : "Groups will open as native Chrome tab groups",
+      "success"
+    );
   });
 
   document.getElementById("btn-export-json")?.addEventListener("click", exportToJson);
