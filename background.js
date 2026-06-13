@@ -12,6 +12,10 @@ function uid() {
 }
 
 function broadcast(payload) {
+  // STORE_UPDATED is handled by storage.onChanged in each page — no sendMessage needed.
+  // Sending to multiple pages with async handlers caused message-channel collisions
+  // that silently killed the native messaging port.
+  if (payload.type === "STORE_UPDATED") return;
   chrome.runtime.sendMessage(payload).catch(() => {});
 }
 
@@ -81,10 +85,13 @@ async function setSettings(partial) {
 
 /** Build a frozen-tab URL that holds a real URL without loading it. */
 function buildSuspendedUrl(tab) {
+  // data:-URI favicons can be tens of KB — embedding them would bloat the tab
+  // URL (and every storage/backup copy of it). Keep only reasonably short ones.
+  const fav = tab.favIconUrl || "";
   const qs = new URLSearchParams({
     u: tab.url || "",
     t: tab.title || tab.url || "",
-    f: tab.favIconUrl || "",
+    f: fav.length <= 2048 ? fav : "",
   });
   return `${chrome.runtime.getURL("suspended.html")}?${qs.toString()}`;
 }
@@ -93,6 +100,54 @@ async function setStore(partial) {
   await chrome.storage.local.set(partial);
   scheduleSyncBackup();
   scheduleFileBackup();
+}
+
+// ── Active-window tab tracking ────────────────────────────────────────────────
+// Maps windowId → { groupUid, tabs: [{id, url, title}] }
+// Built when restoreGroup (freeMode) opens a window; kept live as tabs change.
+// When the window closes we write the final tab list back to the saved group,
+// so changes made while the group is open (closed tabs, navigated URLs) are
+// persisted rather than silently discarded.
+//
+// IMPORTANT: MV3 service workers go idle after ~30 s of no activity, losing
+// in-memory state. We mirror the map to chrome.storage.session (survives SW
+// restarts for the entire browser session) so a window closed after a long
+// idle period still gets its tabs saved correctly.
+const _activeWindows = new Map();
+const _AW_KEY = "_aw";
+
+function _isSuspended(url) {
+  return url.startsWith(chrome.runtime.getURL("suspended.html"));
+}
+function _realUrl(url) {
+  if (!_isSuspended(url)) return url;
+  try { return new URL(url).searchParams.get("u") || url; } catch (_) { return url; }
+}
+function _realTitle(url, title) {
+  if (!_isSuspended(url)) return title;
+  try { return new URL(url).searchParams.get("t") || title; } catch (_) { return title; }
+}
+
+// Debounced write: coalesces rapid tab-event updates into one storage write.
+let _awFlushTimer = null;
+function _awPersist() {
+  clearTimeout(_awFlushTimer);
+  _awFlushTimer = setTimeout(() => {
+    const obj = {};
+    for (const [k, v] of _activeWindows) obj[k] = { groupUid: v.groupUid, tabs: v.tabs };
+    chrome.storage.session.set({ [_AW_KEY]: obj }).catch(() => {});
+  }, 300);
+}
+
+// Called once at SW startup to restore any windows that were open when the
+// SW was last killed (e.g. 30-second idle timeout).
+async function _awRestore() {
+  try {
+    const d = await chrome.storage.session.get(_AW_KEY);
+    for (const [k, v] of Object.entries(d[_AW_KEY] || {})) {
+      _activeWindows.set(Number(k), v);
+    }
+  } catch (_) {}
 }
 
 // ── File backup via NativeHost ────────────────────────────────────────────────
@@ -109,8 +164,15 @@ function scheduleFileBackup() {
 async function doFileBackup() {
   try {
     const store = await getStore();
-    const payload = { v: 4, ts: Date.now(), savedGroups: store.savedGroups, folders: store.folders };
-    await _nativeOneShot("saveBackup", { data: payload }, "saveBackupResult", 8_000);
+    // Strip favicon URLs before backup: they can be data: URIs (5-50 KB each),
+    // inflating the payload past the 1 MB native-messaging limit.
+    // Favicons are cosmetic — URL + title are enough to restore tabs.
+    const savedGroups = store.savedGroups.map(g => ({
+      ...g,
+      tabs: (g.tabs || []).map(({ url, title }) => ({ url, title })),
+    }));
+    const payload = { v: 4, ts: Date.now(), savedGroups, folders: store.folders };
+    await _nativeOneShot("saveBackup", { data: payload }, "saveBackupResult", 10_000);
   } catch (_) {}
 }
 
@@ -118,7 +180,7 @@ async function restoreFromFileBackup() {
   try {
     const local = await chrome.storage.local.get(["savedGroups", "folders"]);
     if ((local.savedGroups || []).length > 0 || (local.folders || []).length > 0) return;
-    const msg = await _nativeOneShot("loadBackup", {}, "loadBackupResult", 10_000);
+    const msg = await _nativeOneShot("loadBackup", {}, "loadBackupResult", 15_000, "loadBackupChunk");
     if (!msg?.ok || !msg.data?.savedGroups?.length) return;
     const savedGroups = (msg.data.savedGroups || []).map(normalizeGroup);
     const folders     = (msg.data.folders     || []).map(normalizeFolder);
@@ -127,13 +189,32 @@ async function restoreFromFileBackup() {
   } catch (_) {}
 }
 
-/** Open a native port, send one message, wait for one response, then disconnect. */
-function _nativeOneShot(action, extra, expectedAction, timeoutMs) {
-  return new Promise((resolve) => {
+// ── Native-host serialization lock ──────────────────────────────────────────
+// Chrome/Windows is unreliable when two native-host ports are open at once
+// (auto-backup colliding with Test Connection / Import is the classic case:
+// the first works, the next "disconnects"). We funnel EVERY connectNative call
+// through a single queue, with a short gap after each so the previous host
+// process fully exits before the next one spawns.
+let _nativeLock = Promise.resolve();
+const _delay = (ms) => new Promise((r) => setTimeout(r, ms));
+function _withNativeLock(task) {
+  const run = _nativeLock.then(task, task);
+  // Keep the chain alive even if a task throws; add a 250ms cooldown gap.
+  _nativeLock = run.then(() => _delay(250), () => _delay(250));
+  return run;
+}
+
+/** Open a native port, send one message, wait for one response, then disconnect.
+ *  If chunkAction is given, intermediate chunk messages are reassembled into
+ *  result.data (hosts must chunk anything that could exceed Chrome's 1 MB
+ *  host→extension message limit). */
+function _nativeOneShot(action, extra, expectedAction, timeoutMs, chunkAction) {
+  return _withNativeLock(() => new Promise((resolve) => {
     let port;
     try { port = chrome.runtime.connectNative(NATIVE_HOST_NAME); } catch (_) { resolve(null); return; }
     if (!port) { resolve(null); return; }
     let done = false;
+    const chunks = [];
     const finish = (v) => {
       if (done) return; done = true;
       clearTimeout(t);
@@ -142,9 +223,17 @@ function _nativeOneShot(action, extra, expectedAction, timeoutMs) {
     };
     const t = setTimeout(() => finish(null), timeoutMs);
     port.onDisconnect.addListener(() => finish(null));
-    port.onMessage.addListener((m) => { if (m?.action === expectedAction) finish(m); });
+    port.onMessage.addListener((m) => {
+      if (chunkAction && m?.action === chunkAction) { chunks[m.index] = m.data; return; }
+      if (m?.action !== expectedAction) return;
+      if (m.chunked) {
+        try { m.data = JSON.parse(chunks.join("")); }
+        catch (_) { finish(null); return; }
+      }
+      finish(m);
+    });
     port.postMessage({ action, ...extra });
-  });
+  }));
 }
 
 // ── Cloud backup ─────────────────────────────────────────────────────────────
@@ -188,8 +277,6 @@ async function doSyncBackup() {
 
 async function restoreFromCloud() {
   try {
-    const local = await chrome.storage.local.get(["savedGroups", "folders"]);
-    if ((local.savedGroups || []).length > 0 || (local.folders || []).length > 0) return;
     const meta = (await chrome.storage.sync.get(SYNC_META_KEY))[SYNC_META_KEY];
     if (!meta?.n) return;
     const chunkKeys = Array.from({ length: meta.n }, (_, i) => SYNC_CHUNK_KEY + i);
@@ -198,6 +285,28 @@ async function restoreFromCloud() {
     if (!json) return;
     const data = JSON.parse(json);
     if (!Array.isArray(data?.g) || !data.g.length) return;
+
+    const local = await chrome.storage.local.get(["savedGroups", "folders"]);
+    const localGroups = local.savedGroups || [];
+
+    // If local already has data, only merge groups that are missing locally
+    // (preserving existing tab URLs — cloud stores only counts).
+    if (localGroups.length > 0) {
+      const localUids = new Set(localGroups.map(g => g.uid));
+      const cloudOnly = data.g
+        .filter(([u]) => !localUids.has(u))
+        .map(([u, t, c, f, n, s]) => normalizeGroup({
+          uid: u, title: t, color: c, folderId: f,
+          tabCount: n, savedAt: s,
+          active: false, chromeGroupId: null, tabs: [], tabsLoaded: false,
+        }));
+      if (!cloudOnly.length) return;
+      await chrome.storage.local.set({ savedGroups: [...localGroups, ...cloudOnly] });
+      broadcast({ type: "STORE_UPDATED" });
+      return;
+    }
+
+    // Local is empty — full restore from cloud (last resort)
     const savedGroups = data.g.map(([u, t, c, f, n, s]) => normalizeGroup({
       uid: u, title: t, color: c, folderId: f,
       tabCount: n, savedAt: s,
@@ -240,6 +349,8 @@ async function snapshotLiveGroups() {
       title: g.title || "",
       color: g.color || "grey",
       tabCount: tabs.length,
+      tabs: tabs.map(t => ({ url: _realUrl(t.url || ""), title: _realTitle(t.url || "", t.title || "") }))
+        .filter(t => t.url && !t.url.startsWith("chrome://")),
     });
   }
   return snapshots;
@@ -293,6 +404,10 @@ async function reconcileInner() {
   const liveWindowIds = new Set((await chrome.windows.getAll()).map((w) => w.id));
   const groups = store.savedGroups;
 
+  // Snapshot key fields BEFORE mutation so we can skip setStore if nothing changed.
+  const oldSig = groups.map(g => `${g.uid}:${g.active}:${g.chromeGroupId}:${g.openWindowId}`).join("|");
+  const oldLen = groups.length;
+
   for (const g of groups) {
     if (!g.active) continue;
     // Free-mode groups live in their own window: active iff that window exists.
@@ -300,6 +415,21 @@ async function reconcileInner() {
       if (!liveWindowIds.has(g.openWindowId)) {
         g.active = false;
         g.openWindowId = null;
+      } else if (!_activeWindows.has(g.openWindowId)) {
+        // Service worker was restarted — rebuild the tracking map for this window.
+        const winId = g.openWindowId;
+        const groupUid = g.uid;
+        chrome.tabs.query({ windowId: winId }).then(tabs => {
+          _activeWindows.set(winId, {
+            groupUid,
+            tabs: tabs.map(t => ({
+              id: t.id,
+              url: _realUrl(t.url || t.pendingUrl || ""),
+              title: _realTitle(t.url || "", t.title || ""),
+            })).filter(t => t.url && !t.url.startsWith("chrome://")),
+          });
+          _awPersist();
+        }).catch(() => {});
       }
       continue; // never treat window-based groups as Chrome tab groups
     }
@@ -342,32 +472,41 @@ async function reconcileInner() {
     }
   }
 
-  await setStore({ savedGroups: groups });
-  broadcast({ type: "STORE_UPDATED" });
+  // Only persist + broadcast if something actually changed (avoids spurious
+  // file-backup triggers every time any tab event fires).
+  const newSig = groups.map(g => `${g.uid}:${g.active}:${g.chromeGroupId}:${g.openWindowId}`).join("|");
+  if (groups.length !== oldLen || newSig !== oldSig) {
+    await setStore({ savedGroups: groups });
+    broadcast({ type: "STORE_UPDATED" });
+  }
 }
+
+const NATIVE_INSTALL_HINT =
+  "Run the installer in the NativeHost folder (install.bat on Windows, " +
+  "install.command on macOS, install.sh on Linux), then restart your browser.";
 
 function _connectNative(onMsg, onError) {
   let port;
   try {
     port = chrome.runtime.connectNative(NATIVE_HOST_NAME);
   } catch (_) {
-    onError("Native host not found. Run NativeHost/install.bat, then restart Chrome.");
+    onError("Native host not found. " + NATIVE_INSTALL_HINT);
     return null;
   }
   if (!port) {
-    onError("Native host not found. Run NativeHost/install.bat, then restart Chrome.");
+    onError("Native host not found. " + NATIVE_INSTALL_HINT);
     return null;
   }
   port.onDisconnect.addListener(() => {
     const err = chrome.runtime.lastError?.message;
-    onError(err || "Native host disconnected. Run install.bat and restart Chrome.");
+    onError(err || "Native host disconnected. " + NATIVE_INSTALL_HINT);
   });
   port.onMessage.addListener(onMsg);
   return port;
 }
 
-function listChromeProfiles() {
-  return new Promise((resolve) => {
+function _listChromeProfilesOnce() {
+  return _withNativeLock(() => new Promise((resolve) => {
     let settled = false;
     const finish = (result) => {
       if (settled) return;
@@ -386,11 +525,25 @@ function listChromeProfiles() {
     if (!port) return;
     const timer = setTimeout(() => finish({ ok: false, error: "Timed out waiting for native host", profiles: [] }), 10_000);
     port.postMessage({ action: "listProfiles" });
-  });
+  }));
+}
+
+// listChromeProfiles is the entry point for BOTH Test Connection and Import.
+// A native port can disconnect transiently (e.g. a leftover host process from a
+// previous op hasn't fully exited yet — the classic "first works, next drops").
+// One automatic retry after a short settle lets the queue self-heal so the user
+// doesn't see a spurious failure.
+async function listChromeProfiles() {
+  const first = await _listChromeProfilesOnce();
+  if (first?.ok) return first;
+  await _delay(400);
+  const second = await _listChromeProfilesOnce();
+  // Prefer the successful/most-informative result.
+  return second?.ok ? second : (second || first);
 }
 
 function importFromChrome(profileDirs = null) {
-  return new Promise((resolve) => {
+  return _withNativeLock(() => new Promise((resolve) => {
     let settled = false;
     const finish = (result) => {
       if (settled) return;
@@ -399,12 +552,30 @@ function importFromChrome(profileDirs = null) {
       try { port?.disconnect(); } catch (_) {}
       resolve(result);
     };
+    // Chrome caps host->extension messages at 1 MB, so the host streams the
+    // export as multiple "extractChunk" messages, then a final "extractResult".
+    const chunks = [];
     const port = _connectNative(
       async (msg) => {
+        if (msg?.action === "extractChunk") {
+          chunks[msg.index] = msg.data;
+          return;
+        }
         if (msg?.action !== "extractResult") return;
         if (!msg.ok) { finish({ ok: false, error: msg.error || "Extraction failed" }); return; }
-        const res = await importStore(msg.data);
-        finish({ ok: true, added: res.added, total: (msg.data?.savedGroups || []).length });
+        let data;
+        if (msg.chunked) {
+          try {
+            data = JSON.parse(chunks.join(""));
+          } catch (e) {
+            finish({ ok: false, error: "Could not reassemble data (chunk error): " + e.message });
+            return;
+          }
+        } else {
+          data = msg.data; // backward-compat with old single-message host
+        }
+        const res = await importStore(data);
+        finish({ ok: true, added: res.added, total: (data?.savedGroups || []).length });
       },
       (err) => finish({ ok: false, error: err })
     );
@@ -414,7 +585,7 @@ function importFromChrome(profileDirs = null) {
       IMPORT_TIMEOUT_MS
     );
     port.postMessage({ action: "extract", profileDirs });
-  });
+  }));
 }
 
 async function importStore(data) {
@@ -459,27 +630,90 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // When a free-mode window is closed, mark its group inactive immediately.
 chrome.windows.onRemoved.addListener(async (windowId) => {
+  // Grab the last-known tab list before discarding the tracking entry.
+  const tracked = _activeWindows.get(windowId);
+  _activeWindows.delete(windowId);
+  _awPersist();
+
   const store = await getStore();
   let changed = false;
   for (const g of store.savedGroups) {
-    if (g.openWindowId === windowId) {
-      g.active = false;
-      g.openWindowId = null;
-      changed = true;
+    if (g.openWindowId !== windowId) continue;
+    // Write the final tab state back so manual changes (closed tabs,
+    // navigations) survive the next time the group is opened.
+    if (tracked?.tabs.length) {
+      g.tabs = tracked.tabs.map(({ url, title }) => ({ url, title }));
+      g.tabCount = g.tabs.length;
+      g.tabsLoaded = true;
     }
+    g.active = false;
+    g.openWindowId = null;
+    changed = true;
   }
   if (changed) {
     await setStore({ savedGroups: store.savedGroups });
-    broadcast({ type: "STORE_UPDATED" });
+    // storage.onChanged notifies all pages — no explicit sendMessage needed.
   }
 });
 
 chrome.tabGroups.onCreated.addListener(scheduleReconcile);
 chrome.tabGroups.onUpdated.addListener(scheduleReconcile);
 chrome.tabGroups.onRemoved.addListener(scheduleReconcile);
-chrome.tabs.onRemoved.addListener(scheduleReconcile);
-chrome.tabs.onCreated.addListener(scheduleReconcile);
-chrome.tabs.onUpdated.addListener((_id, info) => {
+chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
+  if (!removeInfo.isWindowClosing) {
+    // Individual tab close — remove from tracking map and update stored tabCount
+    // immediately so the sidepanel reflects the real count in real-time.
+    for (const data of _activeWindows.values()) {
+      const idx = data.tabs.findIndex(t => t.id === tabId);
+      if (idx >= 0) {
+        data.tabs.splice(idx, 1);
+        _awPersist();
+        const store = await getStore();
+        const g = store.savedGroups.find(sg => sg.uid === data.groupUid);
+        if (g) { g.tabCount = data.tabs.length; await setStore({ savedGroups: store.savedGroups }); }
+        break;
+      }
+    }
+  }
+  scheduleReconcile();
+});
+
+chrome.tabs.onCreated.addListener(async (tab) => {
+  // Track tabs added to an active group window after it was opened.
+  const data = _activeWindows.get(tab.windowId);
+  if (data && tab.url && !tab.url.startsWith("chrome://") && !_isSuspended(tab.url)) {
+    data.tabs.push({ id: tab.id, url: tab.url, title: tab.title || "" });
+    _awPersist();
+    const store = await getStore();
+    const g = store.savedGroups.find(sg => sg.uid === data.groupUid);
+    if (g) { g.tabCount = data.tabs.length; await setStore({ savedGroups: store.savedGroups }); }
+  }
+  scheduleReconcile();
+});
+
+chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+  // Keep tracking map current when a tab navigates or its title changes.
+  if (info.url || info.title) {
+    let changed = false;
+    for (const data of _activeWindows.values()) {
+      const tracked = data.tabs.find(t => t.id === tabId);
+      if (tracked) {
+        if (info.url) tracked.url = _realUrl(info.url);
+        if (info.title) tracked.title = info.title;
+        changed = true;
+      } else if (info.url && !info.url.startsWith("chrome://") && !_isSuspended(info.url)
+                 && _activeWindows.has(tab.windowId)) {
+        // Tab started as chrome://newtab and navigated to a real page — add it now.
+        _activeWindows.get(tab.windowId).tabs.push({
+          id: tabId,
+          url: _realUrl(info.url),
+          title: info.title || tab.title || "",
+        });
+        changed = true;
+      }
+    }
+    if (changed) _awPersist();
+  }
   if (info.groupId !== undefined || info.title || info.url) scheduleReconcile();
 });
 
@@ -507,13 +741,45 @@ const handlers = {
     const store = await getStore();
     const group = buildIndexes(store).groupsByUid.get(groupUid);
     if (!group) return { ok: false };
+
+    // Already have tabs — return them
+    if (group.tabsLoaded && group.tabs?.length) return { ok: true, tabs: group.tabs };
+
+    // Try _activeWindows first (fastest, no Chrome API needed)
+    if (group.openWindowId != null) {
+      const tracked = _activeWindows.get(group.openWindowId);
+      if (tracked?.tabs?.length) {
+        group.tabs = tracked.tabs.map(({ url, title }) => ({ url, title }));
+        group.tabCount = group.tabs.length;
+        group.tabsLoaded = true;
+        await setStore({ savedGroups: store.savedGroups });
+        return { ok: true, tabs: group.tabs };
+      }
+    }
+    // Try Chrome tab group (non-freeMode active groups)
     if (group.active && group.chromeGroupId != null) {
-      const tabs = await readLiveTabs(group.chromeGroupId);
-      group.tabs = tabs;
-      group.tabCount = tabs.length;
-      group.tabsLoaded = true;
-      await setStore({ savedGroups: store.savedGroups });
-      return { ok: true, tabs };
+      const tabs = await readLiveTabs(group.chromeGroupId).catch(() => []);
+      if (tabs.length) {
+        group.tabs = tabs;
+        group.tabCount = tabs.length;
+        group.tabsLoaded = true;
+        await setStore({ savedGroups: store.savedGroups });
+        return { ok: true, tabs };
+      }
+    }
+    // Try open window directly
+    if (group.openWindowId != null) {
+      const winTabs = await chrome.tabs.query({ windowId: group.openWindowId }).catch(() => []);
+      const mapped = winTabs
+        .map(t => ({ url: _realUrl(t.url || ""), title: _realTitle(t.url || "", t.title || "") }))
+        .filter(t => t.url && !t.url.startsWith("chrome://"));
+      if (mapped.length) {
+        group.tabs = mapped;
+        group.tabCount = mapped.length;
+        group.tabsLoaded = true;
+        await setStore({ savedGroups: store.savedGroups });
+        return { ok: true, tabs: mapped };
+      }
     }
     return { ok: true, tabs: group.tabs || [] };
   },
@@ -522,7 +788,45 @@ const handlers = {
     const store = await getStore();
     const group = buildIndexes(store).groupsByUid.get(groupUid);
     if (!group) return { ok: false };
-    if (!group.tabs?.length) return { ok: false, error: "No tabs stored for this group" };
+
+    // Tabs missing — try every recovery path before giving up.
+    if (!group.tabs?.length) {
+      // Path 1: window is open and tracked in _activeWindows
+      if (group.openWindowId != null) {
+        const tracked = _activeWindows.get(group.openWindowId);
+        if (tracked?.tabs?.length) {
+          group.tabs = tracked.tabs.map(({ url, title }) => ({ url, title }));
+          group.tabCount = group.tabs.length;
+          group.tabsLoaded = true;
+        }
+      }
+      // Path 2: active Chrome tab group — query live
+      if (!group.tabs?.length && group.active && group.chromeGroupId != null) {
+        const liveTabs = await readLiveTabs(group.chromeGroupId).catch(() => []);
+        if (liveTabs.length) {
+          group.tabs = liveTabs;
+          group.tabCount = liveTabs.length;
+          group.tabsLoaded = true;
+        }
+      }
+      // Path 3: freeMode window open — query by windowId
+      if (!group.tabs?.length && group.openWindowId != null) {
+        const winTabs = await chrome.tabs.query({ windowId: group.openWindowId }).catch(() => []);
+        const mapped = winTabs
+          .map(t => ({ url: _realUrl(t.url || ""), title: _realTitle(t.url || "", t.title || "") }))
+          .filter(t => t.url && !t.url.startsWith("chrome://"));
+        if (mapped.length) {
+          group.tabs = mapped;
+          group.tabCount = mapped.length;
+          group.tabsLoaded = true;
+        }
+      }
+      if (group.tabs?.length) {
+        await setStore({ savedGroups: store.savedGroups });
+      } else {
+        return { ok: false, error: "No tabs stored for this group" };
+      }
+    }
 
     const settings = await getSettings();
     const useLazy = lazy === undefined ? settings.lazyRestore !== false : !!lazy;
@@ -550,6 +854,20 @@ const handlers = {
       group.active = true;
       group.openWindowId = win.id;
       group.chromeGroupId = null;
+
+      // Seed the tracking map so tab changes (closes, navigations) are captured.
+      // windows.create resolves after all tabs are created, so the query is safe.
+      const seedTabs = await chrome.tabs.query({ windowId: win.id });
+      _activeWindows.set(win.id, {
+        groupUid: group.uid,
+        tabs: seedTabs.map(t => ({
+          id: t.id,
+          url: _realUrl(t.url || t.pendingUrl || ""),
+          title: _realTitle(t.url || "", t.title || ""),
+        })).filter(t => t.url && !t.url.startsWith("chrome://")),
+      });
+      _awPersist();
+
       await setStore({ savedGroups: store.savedGroups });
       broadcast({ type: "STORE_UPDATED" });
       return { ok: true, freeMode: true, lazy: useLazy, count: urls.length, windowId: win.id };
@@ -579,12 +897,27 @@ const handlers = {
     if (!group) return { ok: false };
 
     if (group.openWindowId != null) {
+      // Save current tab state before closing the window
+      const tracked = _activeWindows.get(group.openWindowId);
+      if (tracked?.tabs.length) {
+        group.tabs = tracked.tabs.map(({ url, title }) => ({ url, title }));
+        group.tabCount = group.tabs.length;
+        group.tabsLoaded = true;
+      }
+      _activeWindows.delete(group.openWindowId);
+      _awPersist();
       try { await chrome.windows.remove(group.openWindowId); } catch (_) {}
     } else if (group.chromeGroupId != null) {
       try {
-        const tabs = await chrome.tabs.query({ groupId: group.chromeGroupId });
-        const ids = tabs.map(t => t.id).filter(Boolean);
-        if (ids.length) await chrome.tabs.remove(ids);
+        // Save current tab state from the Chrome tab group before closing
+        const liveTabs = await readLiveTabs(group.chromeGroupId);
+        if (liveTabs.length) {
+          group.tabs = liveTabs;
+          group.tabCount = liveTabs.length;
+          group.tabsLoaded = true;
+        }
+        const tabIds = (await chrome.tabs.query({ groupId: group.chromeGroupId })).map(t => t.id).filter(Boolean);
+        if (tabIds.length) await chrome.tabs.remove(tabIds);
       } catch (_) {}
     }
     group.active = false;
@@ -620,6 +953,73 @@ const handlers = {
     await setStore({ savedGroups });
     broadcast({ type: "STORE_UPDATED" });
     return { ok: true };
+  },
+
+  async saveWindowAsGroup({ windowId, title }) {
+    const allTabs = await chrome.tabs.query({ windowId });
+    const tabs = allTabs
+      .filter(t => {
+        const u = t.url || t.pendingUrl || "";
+        return u && !u.startsWith("chrome://") && !u.startsWith("chrome-extension://") && !u.startsWith("about:");
+      })
+      .map(t => ({
+        id: t.id,
+        url: _realUrl(t.url || t.pendingUrl || ""),
+        title: _realTitle(t.url || "", t.title || ""),
+      }));
+    if (!tabs.length) return { ok: false, error: "No saveable tabs in this window" };
+
+    const groupTitle = (title || "").trim() || tabs[0].title || "Captured Window";
+    const newGroup = normalizeGroup({
+      uid: uid(),
+      title: groupTitle,
+      color: "grey",
+      tabs: tabs.map(({ url, title: t }) => ({ url, title: t })),
+      tabCount: tabs.length,
+      tabsLoaded: true,
+      active: true,
+      openWindowId: windowId,
+    });
+
+    const store = await getStore();
+    store.savedGroups.unshift(newGroup);
+    await setStore({ savedGroups: store.savedGroups });
+
+    // Seed tracking map — closing this window will auto-save final tab state
+    _activeWindows.set(windowId, { groupUid: newGroup.uid, tabs });
+    _awPersist();
+
+    broadcast({ type: "STORE_UPDATED" });
+    return { ok: true, groupUid: newGroup.uid, tabCount: tabs.length };
+  },
+
+  async restoreDeletedGroup({ group }) {
+    if (!group || !group.uid) return { ok: false };
+    const store = await getStore();
+    if (store.savedGroups.some(g => g.uid === group.uid)) return { ok: true };
+    store.savedGroups.unshift(normalizeGroup({ ...group, active: false, openWindowId: null, chromeGroupId: null }));
+    await setStore({ savedGroups: store.savedGroups });
+    broadcast({ type: "STORE_UPDATED" });
+    return { ok: true };
+  },
+
+  // Bulk undo for "Delete selected" — restores all snapshots in one storage write.
+  async restoreDeletedGroups({ groups }) {
+    if (!Array.isArray(groups) || !groups.length) return { ok: false };
+    const store = await getStore();
+    const existing = new Set(store.savedGroups.map(g => g.uid));
+    let restored = 0;
+    for (const group of groups) {
+      if (!group?.uid || existing.has(group.uid)) continue;
+      store.savedGroups.unshift(normalizeGroup({ ...group, active: false, openWindowId: null, chromeGroupId: null }));
+      existing.add(group.uid);
+      restored++;
+    }
+    if (restored) {
+      await setStore({ savedGroups: store.savedGroups });
+      broadcast({ type: "STORE_UPDATED" });
+    }
+    return { ok: true, restored };
   },
 
   async updateGroupTitle({ groupUid, title }) {
@@ -820,26 +1220,28 @@ const handlers = {
   async updateSettings({ settings }) {
     return { ok: true, settings: await setSettings(settings || {}) };
   },
-
-  // ── Remove all active Chrome tab groups (tabs stay open, just ungrouped) ─────
-  async closeAllChromeGroups() {
-    try {
-      const groups = await chrome.tabGroups.query({});
-      let count = 0;
-      for (const g of groups) {
-        const tabs = await chrome.tabs.query({ groupId: g.id });
-        const tabIds = tabs.map(t => t.id).filter(Boolean);
-        if (tabIds.length) { await chrome.tabs.ungroup(tabIds).catch(() => {}); count++; }
-      }
-      await reconcile();
-      return { ok: true, count };
-    } catch (e) {
-      return { ok: false, error: e.message };
-    }
-  },
 };
 
-// On startup: try cloud sync backup first, then file backup, then reconcile.
-restoreFromCloud()
+// On startup: restore active-window tracking first (survives SW idle restarts),
+// then cloud backup, then file backup, then reconcile.
+// Startup restore priority:
+// 1. _awRestore   — in-memory window tracking (session storage)
+// 2. restoreFromFileBackup — full tab URLs preserved (v4 format), preferred
+// 3. restoreFromCloud     — last resort; only tab counts, no URLs
+// Both backup restores skip when local storage is already non-empty.
+_awRestore()
   .then(() => restoreFromFileBackup())
+  .then(() => restoreFromCloud())
   .then(() => reconcile());
+
+// Keyboard shortcut: Ctrl+Shift+G → save focused window as group
+chrome.commands.onCommand.addListener(async (command) => {
+  if (command !== "save-window-as-group") return;
+  const win = await chrome.windows.getLastFocused({ populate: false });
+  if (!win || win.type !== "normal") return;
+  const res = await handlers.saveWindowAsGroup({ windowId: win.id, title: "" });
+  if (res.ok) {
+    // Flash the sidepanel open so user sees the new group
+    chrome.sidePanel.open({ windowId: win.id }).catch(() => {});
+  }
+});

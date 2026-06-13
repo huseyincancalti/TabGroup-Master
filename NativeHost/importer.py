@@ -27,10 +27,36 @@ def read_message():
 
 
 def send_message(message):
-    data = json.dumps(message).encode("utf-8")
+    # ensure_ascii=False keeps non-ASCII (Turkish/emoji) as compact UTF-8 instead
+    # of 6-byte \uXXXX escapes, so chunk size math stays predictable.
+    data = json.dumps(message, ensure_ascii=False).encode("utf-8")
     sys.stdout.buffer.write(struct.pack("@I", len(data)))
     sys.stdout.buffer.write(data)
     sys.stdout.buffer.flush()
+
+
+# Chrome drops the native-messaging port if any single host->extension message
+# exceeds 1 MB. A full export (and a large workspace backup) easily passes that,
+# so we slice the JSON payload into chunks well under the limit and let the
+# extension reassemble them.
+CHUNK_CHARS = 256 * 1024
+
+
+def send_chunked(result_action, chunk_action, data):
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    total = max(1, (len(payload) + CHUNK_CHARS - 1) // CHUNK_CHARS)
+    for i in range(total):
+        send_message({
+            "action": chunk_action,
+            "index": i,
+            "total": total,
+            "data": payload[i * CHUNK_CHARS:(i + 1) * CHUNK_CHARS],
+        })
+    send_message({"action": result_action, "ok": True, "chunked": True, "total": total})
+
+
+def send_extract(data):
+    send_chunked("extractResult", "extractChunk", data)
 
 
 def main():
@@ -49,7 +75,7 @@ def main():
             try:
                 profile_dirs = message.get("profileDirs")  # None = all profiles
                 data = tabgroups.extract(profile_dirs=profile_dirs)
-                send_message({"action": "extractResult", "ok": True, "data": data})
+                send_extract(data)
             except Exception as exc:
                 send_message({"action": "extractResult", "ok": False, "error": str(exc)})
         elif action == "saveBackup":
@@ -61,7 +87,12 @@ def main():
         elif action == "loadBackup":
             try:
                 data = tabgroups.load_backup()
-                send_message({"action": "loadBackupResult", "ok": data is not None, "data": data})
+                if data is None:
+                    send_message({"action": "loadBackupResult", "ok": False, "data": None})
+                else:
+                    # Chunked like extract: a large workspace backup (> 1 MB)
+                    # would otherwise kill the port and make restore silently fail.
+                    send_chunked("loadBackupResult", "loadBackupChunk", data)
             except Exception as exc:
                 send_message({"action": "loadBackupResult", "ok": False, "data": None, "error": str(exc)})
 

@@ -1,0 +1,9 @@
+# Normalize line endings so installers work on every OS.
+* text=auto
+
+# Unix shell scripts MUST stay LF (CRLF breaks the #! interpreter line).
+*.sh        text eol=lf
+*.command   text eol=lf
+
+# Windows batch files want CRLF.
+*.bat       text eol=crlf

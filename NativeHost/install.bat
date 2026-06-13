@@ -1,66 +1,36 @@
 @echo off
 setlocal
-
-:: ── Elevate to Administrator if not already ───────────────────────────────────
-net session >nul 2>&1
-if %errorLevel% NEQ 0 (
-    echo Requesting Administrator privileges...
-    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs -Wait"
-    exit /b
-)
+title TabGroup Master - Native Host Setup
 
 echo ============================================================
-echo TabGroup Master -- Install (Administrator)
+echo TabGroup Master -- Native Host Setup (Windows)
 echo ============================================================
 echo.
+echo This is OPTIONAL. The extension already works without it.
+echo It only enables importing your CLOSED / saved tab groups.
+echo No administrator rights are required.
+echo.
 
-:: ── 1. Python dependencies ────────────────────────────────────────────────────
-echo [1/4] Checking Python dependencies...
-python -c "import cramjam" >nul 2>&1
+:: Find Python
+where python >nul 2>&1
 if errorlevel 1 (
-    echo      Installing cramjam...
-    python -m pip install cramjam --quiet
-)
-echo      OK.
-
-:: ── 2. Native host + CRX packing ─────────────────────────────────────────────
-echo [2/4] Running setup (native host + CRX pack)...
-python "%~dp0setup.py"
-if errorlevel 1 (
-    echo      FAILED. Make sure Python is installed.
+    echo [ERROR] Python was not found on your PATH.
+    echo         Install Python 3 from https://python.org and re-run this file.
+    echo.
     pause
     exit /b 1
 )
 
-:: ── 3. Apply Chrome policy (force-install) ────────────────────────────────────
-echo [3/4] Applying Chrome force-install policy...
-regedit /s "%~dp0chrome_policy.reg"
+:: Dependency for reading Chrome's compressed database
+python -c "import cramjam" >nul 2>&1
 if errorlevel 1 (
-    echo      Policy apply failed. Try double-clicking chrome_policy.reg manually.
-) else (
-    echo      OK - extension will auto-install on next Chrome start.
+    echo [1/2] Installing dependency 'cramjam'...
+    python -m pip install --user --quiet cramjam
 )
 
-:: ── 4. Scheduled task (auto re-register on Windows login) ────────────────────
-echo [4/4] Creating scheduled task...
-set TASK=TabGroupMaster_NativeHost
-set PYTHON=python
-set SCRIPT=%~dp0setup.py
-schtasks /create /f /tn "%TASK%" /tr "\"%PYTHON%\" \"%SCRIPT%\"" /sc ONLOGON /rl HIGHEST /ru "%USERNAME%" >nul 2>&1
-if errorlevel 1 (
-    echo      Scheduled task skipped (optional).
-) else (
-    echo      OK.
-)
+echo [2/2] Registering native host...
+python "%~dp0setup.py"
 
 echo.
-echo ============================================================
-echo Setup complete!
-echo.
-echo NEXT STEPS:
-echo   1. Close Chrome (all windows).
-echo   2. Reopen Chrome -- extension installs automatically.
-echo   3. If you see 2 TabGroup Master entries, remove the old one.
-echo ============================================================
-echo.
+echo Close this window, restart your browser, and reload the extension.
 pause

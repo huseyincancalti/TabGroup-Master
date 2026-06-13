@@ -1,4 +1,5 @@
 import os
+import sys
 import glob
 import json
 import shutil
@@ -7,9 +8,22 @@ import time
 
 import leveldb_reader as L
 
-# ── AppData file backup ───────────────────────────────────────────────────────
-# Stored outside the Chrome profile so it survives profile resets.
-_BACKUP_DIR  = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TabGroupMaster")
+
+def _app_data_dir():
+    """Per-OS app data directory, outside any browser profile (survives resets)."""
+    home = os.path.expanduser("~")
+    if os.name == "nt":
+        return os.path.join(os.environ.get("LOCALAPPDATA", home), "TabGroupMaster")
+    if sys.platform == "darwin":
+        return os.path.join(home, "Library", "Application Support", "TabGroupMaster")
+    return os.path.join(
+        os.environ.get("XDG_DATA_HOME", os.path.join(home, ".local", "share")),
+        "TabGroupMaster",
+    )
+
+
+# ── App-data file backup (outside the browser profile, survives resets) ────────
+_BACKUP_DIR  = _app_data_dir()
 _BACKUP_FILE = os.path.join(_BACKUP_DIR, "workspace_backup.json")
 
 
@@ -110,62 +124,86 @@ def _decode(buf, depth=0):
     return fields
 
 
+def _browser_user_data_dirs():
+    """Every installed Chromium browser's 'User Data' root, across Windows/Mac/Linux."""
+    home = os.path.expanduser("~")
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+        cand = [
+            ("Chrome",   os.path.join(local, "Google", "Chrome", "User Data")),
+            ("Edge",     os.path.join(local, "Microsoft", "Edge", "User Data")),
+            ("Brave",    os.path.join(local, "BraveSoftware", "Brave-Browser", "User Data")),
+            ("Vivaldi",  os.path.join(local, "Vivaldi", "User Data")),
+            ("Chromium", os.path.join(local, "Chromium", "User Data")),
+        ]
+    elif sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
+        cand = [
+            ("Chrome",   os.path.join(base, "Google", "Chrome")),
+            ("Edge",     os.path.join(base, "Microsoft Edge")),
+            ("Brave",    os.path.join(base, "BraveSoftware", "Brave-Browser")),
+            ("Vivaldi",  os.path.join(base, "Vivaldi")),
+            ("Chromium", os.path.join(base, "Chromium")),
+        ]
+    else:  # linux / *bsd
+        base = os.path.join(home, ".config")
+        cand = [
+            ("Chrome",   os.path.join(base, "google-chrome")),
+            ("Edge",     os.path.join(base, "microsoft-edge")),
+            ("Brave",    os.path.join(base, "BraveSoftware", "Brave-Browser")),
+            ("Vivaldi",  os.path.join(base, "vivaldi")),
+            ("Chromium", os.path.join(base, "chromium")),
+        ]
+    return [(label, p) for (label, p) in cand if os.path.isdir(p)]
+
+
 def list_profiles():
-    """Return metadata for every Chrome profile that has a Sync Data/LevelDB directory."""
-    user_data = _chrome_user_data_dir()
-    if not user_data:
-        return []
+    """Metadata for every Chromium-browser profile that has a Sync Data/LevelDB dir."""
     profiles = []
-    profile_names = ["Default"] + [
-        os.path.basename(p) for p in glob.glob(os.path.join(user_data, "Profile *"))
-    ]
-    for name in profile_names:
-        leveldb = os.path.join(user_data, name, "Sync Data", "LevelDB")
-        if not os.path.isdir(leveldb):
-            continue
-        display_name = name
-        email = ""
-        try:
-            prefs_path = os.path.join(user_data, name, "Preferences")
-            with open(prefs_path, "r", encoding="utf-8", errors="ignore") as f:
-                prefs = json.load(f)
-            acct_list = prefs.get("account_info", [])
-            if isinstance(acct_list, list) and acct_list:
-                email = acct_list[0].get("email", "")
-            pname = prefs.get("profile", {}).get("name", "")
-            if pname:
-                display_name = pname
-        except Exception:
-            pass
-        profiles.append({
-            "dir": leveldb,
-            "profileName": name,
-            "displayName": display_name,
-            "email": email,
-        })
+    for label, user_data in _browser_user_data_dirs():
+        names = ["Default"] + [
+            os.path.basename(p) for p in glob.glob(os.path.join(user_data, "Profile *"))
+        ]
+        for name in names:
+            leveldb = os.path.join(user_data, name, "Sync Data", "LevelDB")
+            if not os.path.isdir(leveldb):
+                continue
+            display_name = name
+            email = ""
+            try:
+                prefs_path = os.path.join(user_data, name, "Preferences")
+                with open(prefs_path, "r", encoding="utf-8", errors="ignore") as f:
+                    prefs = json.load(f)
+                acct_list = prefs.get("account_info", [])
+                if isinstance(acct_list, list) and acct_list:
+                    email = acct_list[0].get("email", "")
+                pname = prefs.get("profile", {}).get("name", "")
+                if pname:
+                    display_name = pname
+            except Exception:
+                pass
+            profiles.append({
+                "dir": leveldb,
+                "browser": label,
+                "profileName": name,
+                "displayName": f"{label} — {display_name}",
+                "email": email,
+            })
     return profiles
 
 
-def _chrome_user_data_dir():
-    local = os.environ.get("LOCALAPPDATA", "")
-    candidates = [
-        os.path.join(local, "Google", "Chrome", "User Data"),
-        os.path.join(local, "Google", "Chrome Beta", "User Data"),
-        os.path.join(local, "Microsoft", "Edge", "User Data"),
-    ]
-    for path in candidates:
-        if os.path.isdir(path):
-            return path
-    return None
-
-
-def _profile_dirs(user_data):
-    profiles = []
-    for name in ["Default"] + [os.path.basename(p) for p in glob.glob(os.path.join(user_data, "Profile *"))]:
-        leveldb = os.path.join(user_data, name, "Sync Data", "LevelDB")
-        if os.path.isdir(leveldb):
-            profiles.append(leveldb)
-    return profiles
+def _all_profile_dirs():
+    """Every profile's LevelDB dir across all installed Chromium browsers."""
+    dirs = []
+    for _label, user_data in _browser_user_data_dirs():
+        names = ["Default"] + [
+            os.path.basename(p) for p in glob.glob(os.path.join(user_data, "Profile *"))
+        ]
+        for name in names:
+            leveldb = os.path.join(user_data, name, "Sync Data", "LevelDB")
+            if os.path.isdir(leveldb):
+                dirs.append(leveldb)
+    return dirs
 
 
 def _read_entities(leveldb_dir):
@@ -188,14 +226,13 @@ def extract(profile_dirs=None):
 
     profile_dirs: list of absolute LevelDB directory paths to scan, or None to scan all.
     """
-    user_data = _chrome_user_data_dir()
-
     if profile_dirs is not None:
         dirs = [d for d in profile_dirs if isinstance(d, str) and os.path.isdir(d)]
     else:
-        if not user_data:
-            return {"savedGroups": [], "folders": [], "error": "Chrome profile not found"}
-        dirs = _profile_dirs(user_data)
+        dirs = _all_profile_dirs()
+
+    if not dirs:
+        return {"savedGroups": [], "folders": [], "error": "No Chromium browser profile found"}
 
     groups = {}
     tabs = []
@@ -248,7 +285,7 @@ def extract(profile_dirs=None):
     saved_groups.sort(key=lambda g: g["title"].lower())
     return {
         "app": "TabGroup Master",
-        "version": "2.0.0",
+        "version": "1.0.0",
         "exportedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "savedGroups": saved_groups,
         "folders": [],

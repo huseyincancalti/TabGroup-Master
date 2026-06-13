@@ -19,6 +19,7 @@ let state = {
   inboxFilter: "",
   inboxPage: 0,
   cleanupFilter: "",
+  wsFilter: "",
 };
 
 let modalContext = null;
@@ -33,7 +34,66 @@ document.addEventListener("DOMContentLoaded", async () => {
   bindListeners();
   await loadSettings();
   render();
+
+  // Deep-link: dashboard.html#settings jumps straight to the Settings view.
+  if (location.hash === "#settings" && typeof switchView === "function") {
+    switchView("settings");
+  }
 });
+
+let _importBusy = false;
+
+async function _runBrowserImport(getResult) {
+  if (_importBusy) return;
+  if (!window.ChromeGroupImport) {
+    showToast("Importer not loaded — reload the page.", "error");
+    return;
+  }
+  _importBusy = true;
+  const dz = document.getElementById("drop-zone");
+  dz?.classList.add("drop-zone-busy");
+  try {
+    const { savedGroups, folders } = await getResult();
+    if (!savedGroups.length) {
+      showToast("No saved tab groups found there.", "info");
+      return;
+    }
+    const res = await sendMsg({ action: "importJson", data: { savedGroups, folders } });
+    if (res?.ok) {
+      await loadData();
+      render();
+      showToast(
+        `Imported ${res.added} new group${res.added !== 1 ? "s" : ""} (${savedGroups.length} found)`,
+        "success"
+      );
+    } else {
+      showToast("Import failed while saving.", "error");
+    }
+  } catch (e) {
+    if (e && (e.name === "AbortError" || e.name === "NotAllowedError")) return; // cancelled
+    const msg = e?.message || "Import failed";
+    const isBlocked = msg.includes("BLOCKED") || msg.toLowerCase().includes("blocked");
+    showToast(
+      isBlocked
+        ? "⛔ Chrome blocked access — copy the LevelDB folder to Desktop first (see Step 1)"
+        : msg,
+      "error",
+      isBlocked ? 7000 : 4000
+    );
+  } finally {
+    _importBusy = false;
+    dz?.classList.remove("drop-zone-busy");
+  }
+}
+
+function importFromBrowserFolder(fileList) {
+  if (!fileList || !fileList.length) return; // chooser cancelled
+  return _runBrowserImport(() => window.ChromeGroupImport.importFromFileList(fileList));
+}
+
+function importFromDataTransfer(dataTransfer) {
+  return _runBrowserImport(() => window.ChromeGroupImport.importFromDataTransfer(dataTransfer));
+}
 
 async function loadSettings() {
   const res = await sendMsg({ action: "getSettings" });
@@ -44,31 +104,32 @@ async function loadSettings() {
   if (freeEl) freeEl.checked = s.freeMode !== false;
 }
 
-chrome.storage.onChanged.addListener(async (changes, area) => {
+// Storage-event driven updates: reliable regardless of how many extension
+// pages are open. Avoids the async-onMessage channel collision that caused
+// the native-host port to drop when dashboard + sidepanel were both open.
+chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   if (changes.savedGroups || changes.folders) {
-    await loadData();
-    render();
+    loadData().then(() => render()).catch(() => {});
   }
 });
 
-chrome.runtime.onMessage.addListener(async (message) => {
+// onMessage kept only for one-time events that carry extra payload (toasts).
+// Non-async so the message channel closes immediately — no stuck channels.
+chrome.runtime.onMessage.addListener((message) => {
   if (!message) return;
-  if (message.type === "STORE_UPDATED") {
-    await loadData();
-    render();
-  } else if (message.type === "RESTORED_FROM_CLOUD") {
-    await loadData();
-    render();
-    showToast(`♻️ Restored ${message.groupCount} groups + ${message.folderCount} folders from sync backup`, "info");
+  if (message.type === "RESTORED_FROM_CLOUD") {
+    loadData().then(() => {
+      render();
+      showToast(`♻️ Restored ${message.groupCount} groups + ${message.folderCount} folders from sync backup`, "info");
+    }).catch(() => {});
   } else if (message.type === "RESTORED_FROM_BACKUP") {
-    await loadData();
-    render();
-    showToast(
-      `✅ Data restored! ${message.groupCount} groups + ${message.folderCount} folders recovered from local backup.`,
-      "success"
-    );
+    loadData().then(() => {
+      render();
+      showToast(`✅ Data restored! ${message.groupCount} groups + ${message.folderCount} folders recovered from local backup.`, "success");
+    }).catch(() => {});
   }
+  // No return value → channel closes immediately, no response expected.
 });
 
 function sendMsg(message) {
@@ -171,6 +232,17 @@ function normalizeText(str) {
     .toLowerCase();
 }
 
+// Match against the group title AND its stored tab titles/URLs, so searching
+// "github" finds the group that contains a github.com tab. `q` must already
+// be normalized via normalizeText().
+function groupMatchesQuery(group, q) {
+  if (!q) return true;
+  if (normalizeText(group.title || "unnamed group").includes(q)) return true;
+  return (group.tabs || []).some(
+    (t) => normalizeText(t.title || "").includes(q) || normalizeText(t.url || "").includes(q)
+  );
+}
+
 function render() {
   renderOverviewStats();
   const view = state.activeView;
@@ -239,9 +311,7 @@ function renderInbox() {
 
   const allGroups = getInboxGroups();
   const q = normalizeText(state.inboxFilter);
-  const filtered = q
-    ? allGroups.filter((g) => normalizeText(g.title || "unnamed group").includes(q))
-    : allGroups;
+  const filtered = q ? allGroups.filter((g) => groupMatchesQuery(g, q)) : allGroups;
 
   const limit = (state.inboxPage + 1) * INBOX_PAGE_SIZE;
   const visible = filtered.slice(0, limit);
@@ -270,9 +340,37 @@ function renderFoldersTree() {
   const countEl = document.getElementById("tree-count");
   if (!root) return;
 
-  const rootFolders = getChildFolders(null);
+  const q = normalizeText(state.wsFilter || "");
 
-  // Build off-DOM via DocumentFragment — single reflow
+  if (q) {
+    // ── Search mode: flat list of all matching groups across folders + inbox ──
+    const matches = state.savedGroups.filter(g => groupMatchesQuery(g, q));
+
+    root.innerHTML = "";
+    if (!matches.length) {
+      if (empty) { empty.textContent = `No groups matching "${state.wsFilter}".`; empty.classList.remove("hidden"); }
+    } else {
+      if (empty) empty.classList.add("hidden");
+      const frag = document.createDocumentFragment();
+      matches.forEach(g => {
+        const folder = g.folderId ? state.folders.find(f => f.id === g.folderId) : null;
+        const wrap = document.createElement("div");
+        wrap.className = "ws-search-result";
+        const pathEl = document.createElement("div");
+        pathEl.className = "ws-search-path";
+        pathEl.textContent = folder ? `📁 ${folder.name}` : "📥 Inbox";
+        wrap.appendChild(pathEl);
+        wrap.appendChild(buildGroupNode(g, { inInbox: !g.folderId }));
+        frag.appendChild(wrap);
+      });
+      root.appendChild(frag);
+    }
+    if (countEl) countEl.textContent = `${matches.length} found`;
+    return;
+  }
+
+  // ── Normal tree mode ──────────────────────────────────────────────────────
+  const rootFolders = getChildFolders(null);
   const frag = document.createDocumentFragment();
   rootFolders.forEach((folder) => frag.appendChild(buildFolderNode(folder)));
   root.innerHTML = "";
@@ -281,7 +379,7 @@ function renderFoldersTree() {
   const organizedCount = state.savedGroups.filter((g) => g.folderId).length;
   const total = state.folders.length + organizedCount;
   if (countEl) countEl.textContent = String(total);
-  if (empty) empty.classList.toggle("hidden", rootFolders.length > 0);
+  if (empty) { empty.textContent = "No folders yet. Click New Folder to start organizing."; empty.classList.toggle("hidden", rootFolders.length > 0); }
 }
 
 function renderTree() {
@@ -378,7 +476,12 @@ function buildFolderNode(folder) {
 
   wrapper.querySelector(".action-delete").addEventListener("click", async (e) => {
     e.stopPropagation();
-    if (!confirm(`Delete folder "${folder.name}"? Groups return to Inbox; sub-folders move to root.`)) return;
+    const ok = await showModal({
+      title: `Delete folder "${folder.name}"?`,
+      body: "Groups inside will return to Inbox. Sub-folders move to root level.",
+      confirmText: "Delete Folder", danger: true,
+    });
+    if (!ok) return;
     wrapper.remove();
     state.folders = state.folders.filter((f) => f.id !== folder.id);
     state.savedGroups.forEach((g) => {
@@ -492,7 +595,7 @@ function renderTreeTabsList(listEl, tabs) {
     li.className = "tree-group-tab-item";
     const url = t.url || "";
     const title = t.title || url || "Untitled";
-    const isLink = url && !url.startsWith("chrome://") && !url.startsWith("chrome-extension://");
+    const isLink = isSafeHref(url);
     if (isLink) {
       const a = document.createElement("a");
       a.href = url;
@@ -573,6 +676,10 @@ async function toggleTreeGroupTabs(node, group) {
     indexed.tabs = group.tabs;
     indexed.tabCount = group.tabCount;
     indexed.tabsLoaded = true;
+  }
+  if (!group.tabs.length) {
+    list.innerHTML = '<li class="tree-group-tab-empty">Tab URLs not stored — re-capture from Chrome or import from backup file to recover</li>';
+    return;
   }
   renderTreeTabsList(list, group.tabs);
 }
@@ -716,7 +823,7 @@ function _renderCleanupTabsList(listEl, tabs) {
     li.className = "cleanup-tab-item";
     const url = t.url || "";
     const title = t.title || url || "Untitled";
-    const isLink = url && !url.startsWith("chrome://") && !url.startsWith("chrome-extension://");
+    const isLink = isSafeHref(url);
 
     if (isLink) {
       const a = document.createElement("a");
@@ -821,11 +928,22 @@ function renderCleanupUnnamed() {
     });
 
     row.querySelector(".cleanup-btn-del").addEventListener("click", async () => {
+      const name = group.title || "Unnamed Group";
+      const count = group.tabCount || (group.tabs || []).length || 0;
+      const ok = await showModal({
+        title: `Delete "${name}"?`,
+        body: `Permanently removes this group (${count} tab${count !== 1 ? "s" : ""}) from your workspace.`,
+        confirmText: "Delete", danger: true,
+      });
+      if (!ok) return;
+      const groupSnapshot = { ...group, tabs: [...(group.tabs || [])] };
       wrapper.remove();
       state.savedGroups = state.savedGroups.filter((g) => g.uid !== group.uid);
       buildIndexes();
-      showToast("Deleted", "success");
       await sendMsg({ action: "deleteGroup", groupUid: group.uid });
+      showUndoToast(`"${name}" deleted`, () => {
+        sendMsg({ action: "restoreDeletedGroup", group: groupSnapshot });
+      });
     });
 
     wrapper.appendChild(row);
@@ -921,11 +1039,22 @@ function renderCleanupDuplicates() {
       if (idx > 0) {
         row.querySelector(".cleanup-btn-del-dup").addEventListener("click", async (e) => {
           e.stopPropagation();
+          const name = g.title || "Unnamed Group";
+          const count = g.tabCount || (g.tabs || []).length || 0;
+          const okDup = await showModal({
+            title: `Delete duplicate "${name}"?`,
+            body: `Removes this copy (${count} tab${count !== 1 ? "s" : ""}). The original is kept.`,
+            confirmText: "Delete", danger: true,
+          });
+          if (!okDup) return;
+          const groupSnapshot = { ...g, tabs: [...(g.tabs || [])] };
           card.remove();
           await sendMsg({ action: "deleteGroup", groupUid: g.uid });
           await loadData();
           renderCleanupDuplicates();
-          showToast("Deleted", "success");
+          showUndoToast(`"${name}" deleted`, () => {
+            sendMsg({ action: "restoreDeletedGroup", group: groupSnapshot });
+          });
         });
       }
 
@@ -936,6 +1065,13 @@ function renderCleanupDuplicates() {
 
     card.querySelector(".cleanup-btn-merge").addEventListener("click", async () => {
       const keep = sorted[0];
+      const keepName = keep.title || "Unnamed Group";
+      const okMerge = await showModal({
+        title: `Merge ${sorted.length} groups?`,
+        body: `All tabs will be combined into "${keepName}". The other ${sorted.length - 1} group${sorted.length - 1 !== 1 ? "s" : ""} will be removed.`,
+        confirmText: "Merge", icon: "🔀",
+      });
+      if (!okMerge) return;
       for (let i = 1; i < sorted.length; i++) {
         await sendMsg({ action: "mergeGroups", keepUid: keep.uid, mergeUid: sorted[i].uid });
       }
@@ -1081,6 +1217,14 @@ function closeResetWorkspaceModal() {
 }
 
 async function confirmResetWorkspace() {
+  const g = state.savedGroups.length;
+  const f = state.folders.length;
+  const ok = await showModal({
+    title: "Nuke everything?",
+    body: `Permanently deletes all ${g} group${g !== 1 ? "s" : ""} and ${f} folder${f !== 1 ? "s" : ""}. Export a JSON backup first if you need to recover later.`,
+    confirmText: "Yes, nuke it", cancelText: "Cancel", danger: true, icon: "💥",
+  });
+  if (!ok) return;
   closeResetWorkspaceModal();
   await chrome.storage.local.remove(["savedGroups", "folders"]);
   state.savedGroups = [];
@@ -1129,6 +1273,91 @@ function bindListeners() {
     );
   });
 
+  // Dashboard import: list profiles, let the user pick, then import only those.
+  document.getElementById("btn-quick-import")?.addEventListener("click", async () => {
+    const btn = document.getElementById("btn-quick-import");
+    if (btn) { btn.disabled = true; btn.textContent = "⏳ Loading profiles…"; }
+    try {
+      // 1. List available Chrome profiles
+      const listRes = await sendMsg({ action: "listChromeProfiles" });
+      if (!listRes?.ok || !listRes.profiles?.length) {
+        showToast("❌ Could not list profiles: " + (listRes?.error || "native host error"), "error", 5000);
+        return;
+      }
+      const profiles = listRes.profiles;
+      // 2. Ask which profile(s) to import from
+      const lines = profiles.map((p, i) =>
+        `${i + 1}. ${p.displayName || p.profileName}${p.email ? " (" + p.email + ")" : ""}`
+      ).join("\n");
+      const input = await showModal({
+        title: "Choose Profile",
+        body: "Which profile to import from?\nEnter the number (or comma-separated numbers):\n\n" + lines,
+        confirmText: "Import", cancelText: "Cancel", icon: "👤",
+        inputConfig: { placeholder: "e.g. 1  or  1, 2", value: "1" },
+      });
+      if (input === null || !input.trim()) return;
+      const indices = input.split(",")
+        .map((s) => parseInt(s.trim(), 10) - 1)
+        .filter((i) => i >= 0 && i < profiles.length);
+      if (!indices.length) { showToast("Invalid selection", "error"); return; }
+      const dirs = indices.map((i) => profiles[i].dir).filter(Boolean);
+      // Security: never fall back to "all profiles". If nothing resolved, abort.
+      if (!dirs.length) { showToast("Invalid selection", "error"); return; }
+      // 3. Import ONLY from the selected profiles
+      if (btn) btn.textContent = "⏳ Importing…";
+      const res = await sendMsg({ action: "importFromChrome", profileDirs: dirs });
+      if (res?.ok) {
+        await loadData();
+        render();
+        showToast(`✅ Imported ${res.added} new group${res.added !== 1 ? "s" : ""}${res.total ? " (" + res.total + " found)" : ""}`, "success", 5000);
+      } else {
+        showToast("❌ " + (res?.error || "Import failed"), "error", 5000);
+      }
+    } catch (e) {
+      showToast("❌ " + (e?.message || "Import failed"), "error", 5000);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = "⬇ Select Profile & Import"; }
+    }
+  });
+
+  document.getElementById("btn-import-fsa")?.addEventListener("click", () => {
+    document.getElementById("fsa-dir-input")?.click();
+  });
+  document.getElementById("fsa-dir-input")?.addEventListener("change", (e) => {
+    const files = e.target.files;
+    e.target.value = ""; // allow re-selecting the same folder later
+    importFromBrowserFolder(files);
+  });
+
+  // Copy-path buttons
+  document.querySelectorAll(".path-copy-btn[data-copy]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const code = document.getElementById(btn.dataset.copy);
+      if (!code) return;
+      try {
+        await navigator.clipboard.writeText(code.textContent.trim());
+        const old = btn.textContent;
+        btn.textContent = "Copied ✓";
+        setTimeout(() => { btn.textContent = old; }, 1500);
+      } catch (_) { showToast("Copy failed — select the path manually.", "error"); }
+    });
+  });
+
+  // Drag-and-drop zone (bypasses Chrome's sensitive-directory block)
+  const dz = document.getElementById("drop-zone");
+  if (dz) {
+    const over = (e) => { e.preventDefault(); dz.classList.add("drag-over"); };
+    const leave = () => dz.classList.remove("drag-over");
+    dz.addEventListener("dragenter", over);
+    dz.addEventListener("dragover", over);
+    dz.addEventListener("dragleave", leave);
+    dz.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      dz.classList.remove("drag-over");
+      await importFromDataTransfer(e.dataTransfer);
+    });
+  }
+
   document.getElementById("btn-export-json")?.addEventListener("click", exportToJson);
 
   const importInput = document.getElementById("import-file-input");
@@ -1141,6 +1370,11 @@ function bindListeners() {
     renderInbox();
   });
 
+  document.getElementById("ws-search")?.addEventListener("input", (e) => {
+    state.wsFilter = e.target.value;
+    renderFoldersTree();
+  });
+
   document.getElementById("inbox-show-more")?.addEventListener("click", () => {
     state.inboxPage++;
     renderInbox();
@@ -1148,13 +1382,28 @@ function bindListeners() {
 
   document.getElementById("cleanup-delete-selected")?.addEventListener("click", async () => {
     const checked = [...document.querySelectorAll(".cleanup-check:checked")];
-    const uids = checked.map((cb) => cb.closest(".cleanup-row")?.dataset.uid).filter(Boolean);
-    if (!uids.length) { showToast("Select groups first", "info"); return; }
+    // data-uid lives on .cleanup-row-wrap, not on .cleanup-row
+    const uids = checked.map((cb) => cb.closest(".cleanup-row-wrap")?.dataset.uid).filter(Boolean);
+    if (!uids.length) { showToast("Select at least one group first", "info"); return; }
+    const n = uids.length;
+    const okBulk = await showModal({
+      title: `Delete ${n} group${n !== 1 ? "s" : ""}?`,
+      body: `This removes ${n === 1 ? "this group" : `all ${n} selected groups`} from your workspace. You can Undo within 8 seconds.`,
+      confirmText: `Delete ${n}`, cancelText: "Cancel", danger: true, icon: "🗑️",
+    });
+    if (!okBulk) return;
+    // Snapshot BEFORE deleting so Undo can restore everything in one shot.
+    const snapshots = uids
+      .map((u) => state.groupIndex.get(u))
+      .filter(Boolean)
+      .map((g) => ({ ...g, tabs: [...(g.tabs || [])] }));
     const res = await sendMsg({ action: "deleteMultipleGroups", groupUids: uids });
     if (res?.ok) {
-      showToast(`Deleted ${res.deleted} group${res.deleted !== 1 ? "s" : ""}`, "success");
       await loadData();
       renderCleanup();
+      showUndoToast(`Deleted ${res.deleted} group${res.deleted !== 1 ? "s" : ""}`, () => {
+        sendMsg({ action: "restoreDeletedGroups", groups: snapshots });
+      });
     }
   });
 
@@ -1194,13 +1443,13 @@ function bindListeners() {
         resultEl.innerHTML = `
           <p class="diag-err">❌ Connection failed</p>
           <p class="diag-detail">${escHtml(res?.error || "Unknown error")}</p>
-          <p class="diag-hint">Run <code>NativeHost\\install.bat</code>, then fully close Chrome (all windows + Task Manager → kill chrome.exe), and reopen.</p>`;
+          <p class="diag-hint">Run the installer in the <code>NativeHost</code> folder (<code>install.bat</code> on Windows, <code>install.command</code> on macOS, <code>install.sh</code> on Linux), then fully close and reopen your browser.</p>`;
       }
     } catch (e) {
       resultEl.innerHTML = `<p class="diag-err">❌ ${escHtml(e.message)}</p>`;
     } finally {
       btn.disabled = false;
-      btn.textContent = "Test Connection";
+      btn.textContent = "📡 Test Connection";
     }
   });
 
@@ -1227,7 +1476,7 @@ async function exportToJson() {
   const payload = {
     exportedAt: new Date().toISOString(),
     app: "TabGroup Master",
-    version: "2.0.0",
+    version: "1.0.0",
     savedGroups: state.savedGroups,
     folders: state.folders,
   };
@@ -1266,9 +1515,18 @@ async function importFromJson(event) {
   }
 }
 
-function showToast(message, type = "info") {
+const TOAST_MAX = 5;
+function showToast(message, type = "info", durationMs = 3000) {
   const container = document.getElementById("toast-container");
   if (!container || !message) return;
+  // FIFO: if at max capacity, drop the oldest toast
+  const existing = container.querySelectorAll(".toast");
+  if (existing.length >= TOAST_MAX) {
+    const oldest = existing[0];
+    oldest.classList.remove("toast-visible");
+    oldest.classList.add("toast-out");
+    setTimeout(() => oldest.remove(), 300);
+  }
   const toast = document.createElement("div");
   toast.className = `toast toast-${type}`;
   toast.textContent = message;
@@ -1283,7 +1541,103 @@ function showToast(message, type = "info") {
     toast.addEventListener("transitionend", remove, { once: true });
     setTimeout(remove, 400);
   };
-  setTimeout(dismiss, 3000);
+  setTimeout(dismiss, durationMs);
+}
+
+// ── Custom modal (replaces browser confirm / prompt) ─────────────────────────
+function showModal({ title, body = "", confirmText = "Confirm", cancelText = "Cancel", danger = false, icon = null, inputConfig = null }) {
+  return new Promise((resolve) => {
+    const overlay   = document.getElementById("dash-confirm-overlay");
+    const iconEl    = document.getElementById("dash-confirm-icon");
+    const titleEl   = document.getElementById("dash-confirm-title");
+    const bodyEl    = document.getElementById("dash-confirm-body");
+    const inputWrap = document.getElementById("dash-confirm-input-wrap");
+    const inputEl   = document.getElementById("dash-confirm-input");
+    const okBtn     = document.getElementById("dash-confirm-ok");
+    const cancelBtn = document.getElementById("dash-confirm-cancel");
+
+    iconEl.textContent    = icon || (danger ? "🗑️" : inputConfig ? "💾" : "⚠️");
+    titleEl.textContent = title;
+    // Escape first: body strings interpolate group/profile names, which must
+    // never be parsed as HTML (XSS in an extension page = full API access).
+    bodyEl.innerHTML = escHtml(body).replace(/\n/g, "<br>");
+    okBtn.textContent     = confirmText;
+    cancelBtn.textContent = cancelText;
+    okBtn.className = "dash-confirm-btn dash-confirm-ok" + (danger ? " dash-confirm-danger" : "");
+
+    if (inputConfig) {
+      inputWrap.classList.remove("hidden");
+      inputEl.placeholder = inputConfig.placeholder || "";
+      inputEl.value       = inputConfig.value || "";
+      setTimeout(() => { inputEl.focus(); inputEl.select(); }, 60);
+    } else {
+      inputWrap.classList.add("hidden");
+    }
+
+    overlay.classList.remove("hidden");
+    requestAnimationFrame(() => requestAnimationFrame(() => overlay.classList.add("dash-confirm-visible")));
+
+    let done = false;
+    const close = (result) => {
+      if (done) return; done = true;
+      overlay.classList.remove("dash-confirm-visible");
+      setTimeout(() => overlay.classList.add("hidden"), 200);
+      okBtn.removeEventListener("click", onOk);
+      cancelBtn.removeEventListener("click", onCancel);
+      document.removeEventListener("keydown", onKey);
+      overlay.removeEventListener("click", onBg);
+      resolve(result);
+    };
+    const onOk     = () => close(inputConfig ? inputEl.value : true);
+    const onCancel = () => close(inputConfig ? null : false);
+    const onKey    = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); onCancel(); }
+      if (e.key === "Enter")  { e.preventDefault(); onOk(); }
+    };
+    const onBg = (e) => { if (e.target === overlay) onCancel(); };
+
+    okBtn.addEventListener("click", onOk);
+    cancelBtn.addEventListener("click", onCancel);
+    document.addEventListener("keydown", onKey);
+    overlay.addEventListener("click", onBg);
+  });
+}
+
+function showUndoToast(message, onUndo) {
+  const container = document.getElementById("toast-container");
+  if (!container) return;
+  const existing = container.querySelectorAll(".toast");
+  if (existing.length >= TOAST_MAX) {
+    const oldest = existing[0];
+    oldest.classList.remove("toast-visible");
+    oldest.classList.add("toast-out");
+    setTimeout(() => oldest.remove(), 300);
+  }
+  const toast = document.createElement("div");
+  toast.className = "toast toast-warning toast-with-action";
+  const span = document.createElement("span");
+  span.textContent = message;
+  const btn = document.createElement("button");
+  btn.className = "toast-undo-btn";
+  btn.textContent = "Undo";
+  toast.appendChild(span);
+  toast.appendChild(btn);
+  container.appendChild(toast);
+  requestAnimationFrame(() => requestAnimationFrame(() => toast.classList.add("toast-visible")));
+  let dismissed = false;
+  const dismiss = () => {
+    if (dismissed) return;
+    dismissed = true;
+    toast.classList.remove("toast-visible");
+    toast.classList.add("toast-out");
+    setTimeout(() => toast.remove(), 400);
+  };
+  const timer = setTimeout(dismiss, 8000);
+  btn.addEventListener("click", () => {
+    clearTimeout(timer);
+    dismiss();
+    onUndo();
+  });
 }
 
 function escHtml(str) {
@@ -1292,4 +1646,11 @@ function escHtml(str) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+// Only http(s)/ftp/mailto links are safe to render as clickable <a href>.
+// Imported tab URLs are untrusted — a javascript: or data: href would run
+// script in this extension page when clicked. Returns true if safe to link.
+function isSafeHref(url) {
+  return /^(https?|ftp|mailto):/i.test(String(url || "").trim());
 }

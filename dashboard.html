@@ -99,12 +99,13 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <polygon points="5 3 19 12 5 21 5 3"/>
               </svg>
-              <h3>Import your saved groups — First Time Setup</h3>
+              <h3>Quick Start — import in seconds</h3>
             </div>
             <ol class="setup-steps">
-              <li>Run <code>NativeHost/install.bat</code> once (registers the helper and installs its one dependency).</li>
-              <li>Open the side panel and click <strong>Import from Chrome</strong>.</li>
-              <li>All your saved tab groups are read directly from Chrome's local data in a couple of seconds — no tabs opened, no clicking, nothing loaded into memory. Re-run anytime; only new groups are added.</li>
+              <li>Install the native host once: run the installer in the <code>NativeHost</code> folder (<code>install.bat</code> on Windows, <code>install.command</code> on macOS, <code>install.sh</code> on Linux).</li>
+              <li>Open the <strong>side panel</strong> (click the extension icon) and press <strong>Import from Chrome</strong> — or use the Import button in Settings.</li>
+              <li>Pick which Chrome profile to pull from. Only new groups are added; existing data is never overwritten.</li>
+              <li>Organize in <strong>Workspace</strong>, remove clutter in <strong>Cleanup</strong>, open any group anytime from the side panel.</li>
             </ol>
           </article>
 
@@ -173,6 +174,10 @@
               <h3>Folders</h3>
               <span id="tree-count" class="panel-badge">0</span>
             </div>
+            <div class="inbox-search-wrap">
+              <svg class="inbox-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+              <input id="ws-search" type="text" placeholder="Search all groups…" autocomplete="off" spellcheck="false" />
+            </div>
             <div id="folders-tree-container" class="tree-view tree-list" data-folder-id="root"></div>
             <p id="tree-empty" class="panel-empty hidden">No folders yet. Click <strong>New Folder</strong> to start organizing.</p>
           </section>
@@ -224,92 +229,117 @@
         <header class="view-header">
           <div>
             <h2>Settings</h2>
-            <p>Configure native messaging and preferences.</p>
+            <p>Import, preferences, backup, and connection diagnostics.</p>
           </div>
         </header>
 
         <div class="settings-content">
+
+          <!-- ① Import -->
+          <article class="settings-card glass-panel settings-card-accent">
+            <div class="settings-card-header">
+              <span class="settings-card-icon">⬇</span>
+              <div>
+                <h3>Import from Chrome</h3>
+                <p class="settings-desc">Reads all saved/closed tab groups straight from Chrome's local database — no manual file-copying needed.</p>
+              </div>
+            </div>
+            <div class="settings-import-row">
+              <button id="btn-quick-import" class="btn-primary btn-quick-import" type="button">
+                ⬇ Select Profile &amp; Import
+              </button>
+              <p class="quick-import-note">Only the profile you choose is read. No data crosses between accounts. Existing groups are never overwritten — only new ones are added.</p>
+            </div>
+            <p class="quick-import-fallback">
+              Button fails? Run the installer in the <code>NativeHost</code> folder, then fully restart your browser.
+            </p>
+          </article>
+
+          <!-- ② Group behaviour -->
           <article class="settings-card glass-panel">
-            <h3>Data Management</h3>
-            <p class="settings-desc">Export your tab groups and folder layout as a portable JSON backup, or import one back in.</p>
+            <div class="settings-card-header">
+              <span class="settings-card-icon">⚙</span>
+              <div>
+                <h3>Group Behaviour</h3>
+                <p class="settings-desc">Decide what happens when you open a saved group from the side panel.</p>
+              </div>
+            </div>
+            <div class="settings-toggles">
+              <label class="toggle-row" for="toggle-free-mode">
+                <span class="toggle-text">
+                  <span class="toggle-title">Open in their own window</span>
+                  <span class="toggle-sub">Recommended — the group opens in a separate window, completely outside Chrome's native group system. Nothing touches the bookmarks bar or Chrome's saved groups.</span>
+                </span>
+                <span class="switch">
+                  <input type="checkbox" id="toggle-free-mode" checked />
+                  <span class="switch-track"><span class="switch-thumb"></span></span>
+                </span>
+              </label>
+              <label class="toggle-row" for="toggle-lazy-restore">
+                <span class="toggle-text">
+                  <span class="toggle-title">Lazy tab loading</span>
+                  <span class="toggle-sub">Recommended — tabs load only when you click them. A 100-tab group uses almost no RAM until you need it.</span>
+                </span>
+                <span class="switch">
+                  <input type="checkbox" id="toggle-lazy-restore" checked />
+                  <span class="switch-track"><span class="switch-thumb"></span></span>
+                </span>
+              </label>
+            </div>
+          </article>
+
+          <!-- ③ Backup / restore -->
+          <article class="settings-card glass-panel">
+            <div class="settings-card-header">
+              <span class="settings-card-icon">💾</span>
+              <div>
+                <h3>Backup &amp; Restore</h3>
+                <p class="settings-desc">Export your entire workspace as a portable JSON file, or restore from a previous backup.</p>
+              </div>
+            </div>
             <div class="settings-actions">
-              <button id="btn-export-json" class="btn-primary btn-export" type="button">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                Export to JSON
-              </button>
-              <button id="btn-import-json" class="btn-secondary btn-import" type="button">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                Import JSON
-              </button>
+              <button id="btn-export-json" class="btn-primary btn-export" type="button">⬇ Export JSON</button>
+              <button id="btn-import-json" class="btn-secondary btn-import" type="button">⬆ Import JSON</button>
               <input type="file" id="import-file-input" accept="application/json,.json" hidden />
             </div>
           </article>
 
+          <!-- ④ Diagnostics -->
           <article class="settings-card glass-panel">
-            <h3>How groups open</h3>
-            <p class="settings-desc">Two preferences that decide what happens when you open a saved group.</p>
-
-            <label class="toggle-row" for="toggle-free-mode">
-              <span class="toggle-text">
-                <span class="toggle-title">Open in their own window (no Chrome groups)</span>
-                <span class="toggle-sub">Recommended — keeps everything out of Chrome's saved groups &amp; bookmarks bar. The group lives only inside TabGroup Master. Closing the window never saves anything to Chrome.</span>
-              </span>
-              <span class="switch">
-                <input type="checkbox" id="toggle-free-mode" checked />
-                <span class="switch-track"><span class="switch-thumb"></span></span>
-              </span>
-            </label>
-
-            <label class="toggle-row" for="toggle-lazy-restore" style="margin-top:16px;">
-              <span class="toggle-text">
-                <span class="toggle-title">Open tabs frozen (lazy loading)</span>
-                <span class="toggle-sub">Recommended — each tab uses almost no RAM until you click it, so a 100-tab group never freezes your browser. Turn off to load every tab immediately.</span>
-              </span>
-              <span class="switch">
-                <input type="checkbox" id="toggle-lazy-restore" checked />
-                <span class="switch-track"><span class="switch-thumb"></span></span>
-              </span>
-            </label>
-          </article>
-
-          <article class="settings-card glass-panel">
-            <h3>Native Host Diagnostics</h3>
-            <p class="settings-desc">Troubleshoot the native messaging connection. If Import fails, test here first.</p>
+            <div class="settings-card-header">
+              <span class="settings-card-icon">📡</span>
+              <div>
+                <h3>Native Host Diagnostics</h3>
+                <p class="settings-desc">Test the native messaging connection. If Import fails, start here.</p>
+              </div>
+            </div>
             <div class="diag-info">
               <div class="diag-row">
                 <span class="diag-label">Extension ID</span>
                 <code id="diag-ext-id" class="diag-value">—</code>
               </div>
             </div>
-            <div class="settings-actions" style="margin-bottom:12px;">
-              <button id="btn-test-native" class="btn-secondary" type="button">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;margin-right:5px;"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07A19.5 19.5 0 013.07 9.8 19.79 19.79 0 01.37 1.18 2 2 0 012.35 0h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L6.91 7.91a16 16 0 006.1 6.1l.79-.79a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>
-                Test Connection
-              </button>
+            <div class="settings-actions settings-actions-sm">
+              <button id="btn-test-native" class="btn-secondary" type="button">📡 Test Connection</button>
             </div>
             <div id="diag-result" class="diag-result hidden"></div>
             <details class="diag-steps-details">
-              <summary class="diag-steps-summary">Troubleshooting steps</summary>
-              <ol class="setup-steps" style="margin-top:10px;">
-                <li>Run <code>NativeHost\install.bat</code> as the current Windows user (double-click).</li>
-                <li>Fully close Chrome — <strong>all windows</strong>. Open Task Manager and end any remaining <code>chrome.exe</code> processes.</li>
-                <li>Re-open Chrome, reload the extension at <code>chrome://extensions</code>, then test again.</li>
-                <li>If still failing, open <code>NativeHost\com.tabgroup.master.json</code> and verify the <code>allowed_origins</code> value matches the Extension ID shown above.</li>
-              </ol>
+              <summary class="diag-steps-summary">Connection keeps dropping? Read this</summary>
+              <div class="diag-guide">
+                <p class="diag-guide-note"><strong>Symptom:</strong> the first connection works, then Test Connection / Import "disconnects" — often after the Dashboard has been open for a while.</p>
+                <p class="diag-guide-note">This is almost always a leftover native-host process. Quick fix:</p>
+                <ol class="setup-steps">
+                  <li>Press <strong>📡 Test Connection</strong> above. If it succeeds, you're good — just retry your action.</li>
+                  <li>If it fails, open <strong>Task Manager</strong> (Ctrl+Shift+Esc) → <em>Details</em> tab → end any stray <code>python.exe</code> or <code>pythonw.exe</code> left by the host.</li>
+                  <li>Reload the extension at <code>chrome://extensions</code> (🔄). Then press Test Connection again.</li>
+                  <li>Still failing? Fully close Chrome (end every <code>chrome.exe</code> in Task Manager), reopen, and re-run <code>NativeHost\install.bat</code>.</li>
+                  <li>As a last check, open <code>NativeHost\com.tabgroup.master.json</code> and confirm <code>allowed_origins</code> matches the Extension ID shown above.</li>
+                </ol>
+                <p class="diag-guide-note">Your saved groups are stored inside the extension and are <strong>never affected</strong> by a host disconnect — only Import and Backup use the host.</p>
+              </div>
             </details>
           </article>
 
-          <article class="settings-card glass-panel">
-            <h3>Language (i18n)</h3>
-            <p class="settings-desc">Multi-language support coming soon. JSON translation files will plug in here.</p>
-            <div class="lang-field">
-              <label for="lang-select">Interface Language</label>
-              <select id="lang-select" disabled>
-                <option value="en" selected>English (Default)</option>
-              </select>
-              <span class="lang-lock">🔒 Locked — translations in development</span>
-            </div>
-          </article>
         </div>
       </section>
     </main>
@@ -340,9 +370,26 @@
     </div>
   </div>
 
-  <div id="toast-container"></div>
+  <!-- Universal confirm / input modal -->
+  <div id="dash-confirm-overlay" class="dash-confirm-overlay hidden" role="dialog" aria-modal="true">
+    <div class="dash-confirm-box" role="document">
+      <div id="dash-confirm-icon" class="dash-confirm-icon" aria-hidden="true"></div>
+      <h3 id="dash-confirm-title" class="dash-confirm-title"></h3>
+      <div id="dash-confirm-body" class="dash-confirm-body"></div>
+      <div id="dash-confirm-input-wrap" class="dash-confirm-input-wrap hidden">
+        <input type="text" id="dash-confirm-input" class="dash-confirm-input" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="dash-confirm-actions">
+        <button id="dash-confirm-cancel" class="dash-confirm-btn dash-confirm-cancel" type="button">Cancel</button>
+        <button id="dash-confirm-ok" class="dash-confirm-btn dash-confirm-ok" type="button">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-container" role="status" aria-live="polite"></div>
 
   <script src="Sortable.min.js"></script>
+  <script src="lib/chrome_import.js"></script>
   <script src="dashboard.js"></script>
 </body>
 </html>

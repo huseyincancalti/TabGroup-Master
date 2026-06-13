@@ -23,31 +23,32 @@ document.addEventListener("DOMContentLoaded", async () => {
   render();
 });
 
-chrome.storage.onChanged.addListener(async (changes, area) => {
+// Storage-event driven updates: reliable regardless of how many extension
+// pages are open. Avoids the async-onMessage channel collision that caused
+// the native-host port to drop when dashboard + sidepanel were both open.
+chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   if (changes.savedGroups || changes.folders) {
-    await loadData();
-    render();
+    loadData().then(() => render()).catch(() => {});
   }
 });
 
-chrome.runtime.onMessage.addListener(async (message) => {
+// onMessage kept only for one-time events that carry extra payload (toasts).
+// Non-async so the message channel closes immediately — no stuck channels.
+chrome.runtime.onMessage.addListener((message) => {
   if (!message) return;
-  if (message.type === "STORE_UPDATED") {
-    await loadData();
-    render();
-  } else if (message.type === "RESTORED_FROM_CLOUD") {
-    await loadData();
-    render();
-    showToast(`♻️ Restored ${message.groupCount} groups from sync backup`, "info");
+  if (message.type === "RESTORED_FROM_CLOUD") {
+    loadData().then(() => {
+      render();
+      showToast(`♻️ Restored ${message.groupCount} groups from sync backup — open each group once to re-store tab URLs`, "info");
+    }).catch(() => {});
   } else if (message.type === "RESTORED_FROM_BACKUP") {
-    await loadData();
-    render();
-    showToast(
-      `✅ Data restored! ${message.groupCount} groups + ${message.folderCount} folders recovered from local backup.`,
-      "success"
-    );
+    loadData().then(() => {
+      render();
+      showToast(`✅ Data restored! ${message.groupCount} groups + ${message.folderCount} folders recovered from local backup.`, "success");
+    }).catch(() => {});
   }
+  // No return value → channel closes immediately, no response expected.
 });
 
 function sendMsg(message) {
@@ -104,14 +105,45 @@ function titleMatchesSearch(title, query) {
   return normalizeText(title || "Unnamed Group").includes(normalizeText(query));
 }
 
+// Match against the group title AND its stored tab titles/URLs, so searching
+// "github" finds the group that contains a github.com tab.
+function groupMatchesSearch(group, query) {
+  if (!query) return true;
+  if (titleMatchesSearch(group.title, query)) return true;
+  const q = normalizeText(query);
+  return (group.tabs || []).some(
+    (t) => normalizeText(t.title || "").includes(q) || normalizeText(t.url || "").includes(q)
+  );
+}
+
+// Find the query inside raw text and return the RAW character range it covers.
+// Normalization can change string length (NFD strips diacritics: "café" → "cafe"),
+// so we map each normalized char back to the raw index it came from.
+function findNormalizedRange(raw, query) {
+  const nq = normalizeText(query);
+  if (!nq) return null;
+  let norm = "";
+  const rawIndex = [];
+  for (let i = 0; i < raw.length; i++) {
+    const piece = normalizeText(raw[i]);
+    for (let j = 0; j < piece.length; j++) {
+      norm += piece[j];
+      rawIndex.push(i);
+    }
+  }
+  const idx = norm.indexOf(nq);
+  if (idx === -1) return null;
+  return { start: rawIndex[idx], end: rawIndex[idx + nq.length - 1] + 1 };
+}
+
 function highlightTitle(title, query) {
   const raw = title || "Unnamed Group";
   if (!query) return escHtml(raw);
-  const idx = normalizeText(raw).indexOf(normalizeText(query));
-  if (idx === -1) return escHtml(raw);
-  return escHtml(raw.substring(0, idx)) +
-    `<span class="search-highlight">${escHtml(raw.substring(idx, idx + query.length))}</span>` +
-    escHtml(raw.substring(idx + query.length));
+  const range = findNormalizedRange(raw, query);
+  if (!range) return escHtml(raw);
+  return escHtml(raw.substring(0, range.start)) +
+    `<span class="search-highlight">${escHtml(raw.substring(range.start, range.end))}</span>` +
+    escHtml(raw.substring(range.end));
 }
 
 function escHtml(value) {
@@ -132,11 +164,33 @@ function renderTabsList(listEl, tabs) {
   tabs.forEach((tab) => {
     const li = document.createElement("li");
     li.className = "group-tab-item";
-    li.textContent = tab.title || tab.url || "Untitled";
+    if (tab.favIconUrl) {
+      const img = document.createElement("img");
+      img.src = tab.favIconUrl;
+      img.className = "group-tab-favicon";
+      img.alt = "";
+      img.onerror = () => img.remove();
+      li.appendChild(img);
+    }
+    const span = document.createElement("span");
+    span.className = "group-tab-text";
+    span.textContent = tab.title || tab.url || "Untitled";
+    li.appendChild(span);
     li.title = tab.url || "";
     frag.appendChild(li);
   });
   listEl.appendChild(frag);
+}
+
+// "3m ago" / "2h ago" / "5d ago" — compact relative timestamp for group cards.
+function timeAgo(ts) {
+  if (!ts) return "";
+  const s = Math.max(0, (Date.now() - ts) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  if (s < 86400 * 30) return `${Math.floor(s / 86400)}d ago`;
+  return new Date(ts).toLocaleDateString();
 }
 
 async function toggleGroupTabsList(card, group) {
@@ -164,6 +218,10 @@ async function toggleGroupTabsList(card, group) {
   group.tabs = res.tabs || [];
   group.tabCount = group.tabs.length;
   group.tabsLoaded = true;
+  if (!group.tabs.length) {
+    list.innerHTML = "<li class=\"group-tab-empty\">Tab URLs not stored — re-capture this group from Chrome to recover them</li>";
+    return;
+  }
   renderTabsList(list, group.tabs);
 }
 
@@ -197,7 +255,7 @@ function renderActivePane() {
 
   const active = state.savedGroups
     .filter((g) => g.active)
-    .filter((g) => titleMatchesSearch(g.title, state.searchQuery));
+    .filter((g) => groupMatchesSearch(g, state.searchQuery));
 
   document.getElementById("empty-active").classList.toggle("hidden", active.length > 0);
 
@@ -219,11 +277,15 @@ function buildGroupCardHTML(group) {
   const tabCount = getGroupTabCount(group);
   const dot = COLOR_HEX[group.color] || COLOR_HEX.grey;
   const inFolder = group.folderId ? `<span class="folder-tag" title="Organized in Workspace">📁</span>` : "";
+  const trackingBadge = group.openWindowId
+    ? `<div class="group-tracking-badge"><span class="tracking-dot"></span>tracking changes</div>`
+    : "";
   return `
     <span class="group-color-dot" style="background:${dot}"></span>
     <div class="group-info">
       <div class="group-title">${title} ${inFolder}</div>
       <div class="group-tab-count">${tabCount} tab${tabCount !== 1 ? "s" : ""}</div>
+      ${trackingBadge}
     </div>
     <div class="group-actions">
       <button class="edit-group-btn" type="button" title="Edit group">
@@ -263,15 +325,24 @@ function bindActiveCardActions(card, group) {
     openEditModal(group);
   });
 
-  card.querySelector(".delete-active-btn").addEventListener("click", (e) => {
+  card.querySelector(".delete-active-btn").addEventListener("click", async (e) => {
     e.stopPropagation();
-    if (!confirm(`Delete "${group.title || "Unnamed Group"}" permanently?`)) return;
+    const name = group.title || "Unnamed Group";
+    const ok = await showModal({
+      title: `Delete "${name}"?`,
+      body: "Your open Chrome tabs stay open — this only removes the saved entry.",
+      confirmText: "Delete", danger: true,
+    });
+    if (!ok) return;
+    const groupSnapshot = { ...group, tabs: [...(group.tabs || [])] };
     (e.currentTarget.closest(".group-card") || card).remove();
     state.savedGroups = state.savedGroups.filter((g) => g.uid !== group.uid);
     buildIndexes();
     document.getElementById("empty-active")?.classList.toggle("hidden", state.savedGroups.some((g) => g.active));
-    showToast("Group deleted", "success");
     sendMsg({ action: "deleteGroup", groupUid: group.uid });
+    showUndoToast(`"${name}" deleted`, () => {
+      sendMsg({ action: "restoreDeletedGroup", group: groupSnapshot });
+    });
   });
 
   card.querySelector(".close-group-btn").addEventListener("click", async (e) => {
@@ -285,7 +356,7 @@ function bindActiveCardActions(card, group) {
 function getInboxGroups() {
   return state.savedGroups
     .filter((g) => !g.active && g.folderId == null)
-    .filter((g) => titleMatchesSearch(g.title, state.searchQuery));
+    .filter((g) => groupMatchesSearch(g, state.searchQuery));
 }
 
 function updateSavedEmptyState() {
@@ -315,7 +386,7 @@ function renderSavedPane() {
       <span class="group-color-dot" style="background:${dot}"></span>
       <div class="group-info">
         <div class="group-title">${title}</div>
-        <div class="group-tab-count">${tabCount} tab${tabCount !== 1 ? "s" : ""}</div>
+        <div class="group-tab-count">${tabCount} tab${tabCount !== 1 ? "s" : ""}${group.savedAt ? ` <span class="group-saved-at">· ${timeAgo(group.savedAt)}</span>` : ""}</div>
       </div>
       <div class="group-actions">
         <button class="edit-group-btn" type="button" title="Edit group">
@@ -351,14 +422,25 @@ function renderSavedPane() {
       else showToast(res?.error || "Could not restore group", "error");
     });
 
-    card.querySelector(".delete-btn").addEventListener("click", (e) => {
+    card.querySelector(".delete-btn").addEventListener("click", async (e) => {
       e.stopPropagation();
+      const name = group.title || "Unnamed Group";
+      const count = group.tabCount || (group.tabs || []).length || 0;
+      const ok = await showModal({
+        title: `Delete "${name}"?`,
+        body: `Removes ${count} tab${count !== 1 ? "s" : ""} from your Inbox. Your browser tabs are unaffected.`,
+        confirmText: "Delete", danger: true,
+      });
+      if (!ok) return;
+      const groupSnapshot = { ...group, tabs: [...(group.tabs || [])] };
       (e.currentTarget.closest(".saved-group-card") || card).remove();
       state.savedGroups = state.savedGroups.filter((g) => g.uid !== group.uid);
       buildIndexes();
       updateSavedEmptyState();
-      showToast("Group deleted", "success");
       sendMsg({ action: "deleteGroup", groupUid: group.uid });
+      showUndoToast(`"${name}" deleted`, () => {
+        sendMsg({ action: "restoreDeletedGroup", group: groupSnapshot });
+      });
     });
 
     // ── Drag-and-drop reordering ──────────────────────────────────────────────
@@ -577,7 +659,7 @@ function populateProfileList(profiles) {
     label.className = "profile-item";
     const initial = (p.displayName || p.profileName || "?")[0].toUpperCase();
     label.innerHTML = `
-      <input type="checkbox" class="profile-check" value="${escHtml(p.dir)}" checked />
+      <input type="checkbox" class="profile-check" value="${escHtml(p.dir)}" />
       <div class="profile-avatar">${escHtml(initial)}</div>
       <div class="profile-info">
         <span class="profile-display-name">${escHtml(p.displayName || p.profileName)}</span>
@@ -587,52 +669,97 @@ function populateProfileList(profiles) {
   });
 }
 
+// ── Import: show the profile picker, pull only from the chosen profile ──────
+// Security: every Chrome profile / account is kept strictly separate.
+// Only the profile the user picks is imported from — never all of them.
+async function runImport() {
+  if (_importing) return;
+  _importing = true;
+  showImportOverlay();
+  setImportStep("loading");
+  try {
+    const res = await sendMsg({ action: "listChromeProfiles" });
+    if (!res?.ok) {
+      showToast("❌ Could not reach the native host. Run the installer in the NativeHost folder, then restart your browser.", "error");
+      _importing = false;
+      hideImportOverlay();
+      return;
+    }
+    const profiles = res.profiles || [];
+    if (!profiles.length) {
+      showToast("No Chrome profiles found.", "info");
+      _importing = false;
+      hideImportOverlay();
+      return;
+    }
+    populateProfileList(profiles);
+    setImportStep("picker");
+    // _importing stays true until the user makes a selection
+  } catch (e) {
+    showToast("❌ " + (e?.message || "Connection error"), "error");
+    _importing = false;
+    hideImportOverlay();
+  }
+}
+
+// btn-picker-confirm: import only from the selected profiles
 async function doImport(profileDirs) {
+  // Security: never import from all profiles. Require an explicit selection.
+  if (!Array.isArray(profileDirs) || !profileDirs.length) {
+    showToast("⚠️ Select a profile first — only the account you pick is imported.", "info");
+    return;
+  }
   setImportStep("importing");
   try {
-    const res = await sendMsg({ action: "importFromChrome", profileDirs: profileDirs || null });
+    const res = await sendMsg({ action: "importFromChrome", profileDirs });
     if (res?.ok) {
       await loadData();
       render();
-      const msg = res.added > 0
-        ? `Imported ${res.added} new group${res.added !== 1 ? "s" : ""} (${res.total} found)`
-        : `No new groups — ${res.total} already up to date`;
-      showToast(msg, res.added > 0 ? "success" : "info");
+      showToast(`✅ Imported ${res.added} new group${res.added !== 1 ? "s" : ""}${res.total ? ` (${res.total} found)` : ""}`, "success");
     } else {
-      showToast(res?.error || "Import failed", "error");
+      showToast("❌ " + (res?.error || "Import failed"), "error");
     }
+  } catch (e) {
+    showToast("❌ " + (e?.message || "Import failed"), "error");
   } finally {
     _importing = false;
     hideImportOverlay();
   }
 }
 
-async function runImport() {
+async function handleImportFiles(fileList) {
   if (_importing) return;
+  if (!fileList || !fileList.length) return; // cancelled
+  if (!window.ChromeGroupImport) {
+    showToast("Importer not loaded — reopen the panel.", "error");
+    return;
+  }
   _importing = true;
-
-  setImportStep("loading");
+  setImportStep("importing");
   showImportOverlay();
-
-  const profilesRes = await sendMsg({ action: "listChromeProfiles" });
-
-  if (!profilesRes?.ok) {
-    hideImportOverlay();
+  try {
+    const { savedGroups, folders } = await window.ChromeGroupImport.importFromFileList(fileList);
+    if (!savedGroups.length) {
+      showToast("No saved tab groups found in that folder.", "info");
+      return;
+    }
+    const res = await sendMsg({ action: "importJson", data: { savedGroups, folders } });
+    if (res?.ok) {
+      await loadData();
+      render();
+      const msg = res.added > 0
+        ? `Imported ${res.added} new group${res.added !== 1 ? "s" : ""} (${savedGroups.length} found)`
+        : `No new groups — ${savedGroups.length} already imported`;
+      showToast(msg, res.added > 0 ? "success" : "info");
+    } else {
+      showToast("Import failed while saving.", "error");
+    }
+  } catch (e) {
+    showToast(e?.message || "Import failed", "error");
+  } finally {
     _importing = false;
-    showToast(profilesRes?.error || "Native host not found — run NativeHost/install.bat first", "error");
-    return;
+    hideImportOverlay();
   }
-
-  const profiles = profilesRes.profiles || [];
-
-  // 0 or 1 profile → skip the picker, import immediately
-  if (profiles.length <= 1) {
-    await doImport(null);
-    return;
-  }
-
-  populateProfileList(profiles);
-  setImportStep("picker");
 }
 
 async function refreshWorkspace() {
@@ -650,6 +777,14 @@ function closeResetWorkspaceModal() {
 }
 
 async function confirmResetWorkspace() {
+  const g = state.savedGroups.length;
+  const f = state.folders.length;
+  const ok = await showModal({
+    title: "Nuke everything?",
+    body: `This permanently deletes all ${g} group${g !== 1 ? "s" : ""} and ${f} folder${f !== 1 ? "s" : ""}. Export a JSON backup first if you want to recover later.`,
+    confirmText: "Yes, nuke it", cancelText: "Cancel", danger: true, icon: "💥",
+  });
+  if (!ok) return;
   closeResetWorkspaceModal();
   await chrome.storage.local.remove(["savedGroups", "folders"]);
   state.savedGroups = [];
@@ -665,14 +800,29 @@ function bindStaticListeners() {
   });
 
   document.getElementById("btn-import-chrome")?.addEventListener("click", runImport);
+  document.getElementById("sp-dir-input")?.addEventListener("change", (e) => {
+    const files = e.target.files;
+    e.target.value = "";
+    handleImportFiles(files);
+  });
 
   document.getElementById("btn-new-group")?.addEventListener("click", () => openEditModal(null));
 
-  document.getElementById("btn-close-chrome-groups")?.addEventListener("click", async () => {
-    if (!confirm("Ungroup all active Chrome tab groups?\n\nTabs stay open — they just won't be grouped anymore. Your saved groups in TabGroup Master are not affected.")) return;
-    const res = await sendMsg({ action: "closeAllChromeGroups" });
-    if (res?.ok) showToast(`Cleared ${res.count} Chrome group(s) — tabs still open`, "success");
-    else showToast(res?.error || "Could not clear groups", "error");
+  document.getElementById("btn-save-window")?.addEventListener("click", async () => {
+    const name = await showModal({
+      title: "Save This Window",
+      body: "All tabs in this window will be saved as a new group. You can rename it anytime.",
+      confirmText: "Save", cancelText: "Cancel", icon: "💾",
+      inputConfig: { placeholder: "Group name (optional)", value: "" },
+    });
+    if (name === null) return;
+    const win = await chrome.windows.getCurrent();
+    const res = await sendMsg({ action: "saveWindowAsGroup", windowId: win.id, title: name });
+    if (res?.ok) {
+      showToast(`Saved ${res.tabCount} tab${res.tabCount !== 1 ? "s" : ""} — changes tracked until window closes`, "success");
+    } else {
+      showToast(res?.error || "Could not save window", "error");
+    }
   });
 
   document.getElementById("btn-picker-cancel")?.addEventListener("click", () => {
@@ -683,7 +833,12 @@ function bindStaticListeners() {
   document.getElementById("btn-picker-confirm")?.addEventListener("click", async () => {
     const checked = [...document.querySelectorAll(".profile-check:checked")];
     const dirs = checked.map((cb) => cb.value).filter(Boolean);
-    await doImport(dirs.length > 0 ? dirs : null);
+    // Security: if no profile is selected, import NOTHING (importing from all is forbidden).
+    if (!dirs.length) {
+      showToast("⚠️ Select a profile first — only the account you pick is imported.", "info");
+      return;
+    }
+    await doImport(dirs);
   });
 
   document.getElementById("btn-refresh-workspace")?.addEventListener("click", refreshWorkspace);
@@ -733,9 +888,77 @@ function bindStaticListeners() {
   });
 }
 
+// ── Custom modal (replaces browser confirm / prompt) ─────────────────────────
+function showModal({ title, body = "", confirmText = "Confirm", cancelText = "Cancel", danger = false, icon = null, inputConfig = null }) {
+  return new Promise((resolve) => {
+    const overlay   = document.getElementById("sp-confirm-overlay");
+    const iconEl    = document.getElementById("sp-confirm-icon");
+    const titleEl   = document.getElementById("sp-confirm-title");
+    const bodyEl    = document.getElementById("sp-confirm-body");
+    const inputWrap = document.getElementById("sp-confirm-input-wrap");
+    const inputEl   = document.getElementById("sp-confirm-input");
+    const okBtn     = document.getElementById("sp-confirm-ok");
+    const cancelBtn = document.getElementById("sp-confirm-cancel");
+
+    iconEl.textContent   = icon || (danger ? "🗑️" : inputConfig ? "💾" : "⚠️");
+    titleEl.textContent = title;
+    // Escape first: body strings interpolate group/profile names, which must
+    // never be parsed as HTML (XSS in an extension page = full API access).
+    bodyEl.innerHTML = escHtml(body).replace(/\n/g, "<br>");
+    okBtn.textContent    = confirmText;
+    cancelBtn.textContent = cancelText;
+    okBtn.className = "sp-confirm-btn sp-confirm-ok" + (danger ? " sp-confirm-danger" : "");
+
+    if (inputConfig) {
+      inputWrap.classList.remove("hidden");
+      inputEl.placeholder = inputConfig.placeholder || "";
+      inputEl.value       = inputConfig.value || "";
+      setTimeout(() => { inputEl.focus(); inputEl.select(); }, 60);
+    } else {
+      inputWrap.classList.add("hidden");
+    }
+
+    overlay.classList.remove("hidden");
+    requestAnimationFrame(() => requestAnimationFrame(() => overlay.classList.add("sp-confirm-visible")));
+
+    let done = false;
+    const close = (result) => {
+      if (done) return; done = true;
+      overlay.classList.remove("sp-confirm-visible");
+      setTimeout(() => overlay.classList.add("hidden"), 200);
+      okBtn.removeEventListener("click", onOk);
+      cancelBtn.removeEventListener("click", onCancel);
+      document.removeEventListener("keydown", onKey);
+      overlay.removeEventListener("click", onBg);
+      resolve(result);
+    };
+    const onOk     = () => close(inputConfig ? inputEl.value : true);
+    const onCancel = () => close(inputConfig ? null : false);
+    const onKey    = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); onCancel(); }
+      if (e.key === "Enter")  { e.preventDefault(); onOk(); }
+    };
+    const onBg = (e) => { if (e.target === overlay) onCancel(); };
+
+    okBtn.addEventListener("click", onOk);
+    cancelBtn.addEventListener("click", onCancel);
+    document.addEventListener("keydown", onKey);
+    overlay.addEventListener("click", onBg);
+  });
+}
+
+const TOAST_MAX = 5;
 function showToast(message, type = "info") {
   const container = document.getElementById("toast-container");
   if (!container || !message) return;
+  // FIFO: if at max capacity, immediately drop the oldest toast
+  const existing = container.querySelectorAll(".toast");
+  if (existing.length >= TOAST_MAX) {
+    const oldest = existing[0];
+    oldest.classList.remove("toast-visible");
+    oldest.classList.add("toast-out");
+    setTimeout(() => oldest.remove(), 300);
+  }
   const toast = document.createElement("div");
   toast.className = `toast toast-${type}`;
   toast.textContent = message;
@@ -747,4 +970,41 @@ function showToast(message, type = "info") {
     setTimeout(() => toast.remove(), 400);
   };
   setTimeout(dismiss, 3000);
+}
+
+function showUndoToast(message, onUndo) {
+  const container = document.getElementById("toast-container");
+  if (!container) return;
+  const existing = container.querySelectorAll(".toast");
+  if (existing.length >= TOAST_MAX) {
+    const oldest = existing[0];
+    oldest.classList.remove("toast-visible");
+    oldest.classList.add("toast-out");
+    setTimeout(() => oldest.remove(), 300);
+  }
+  const toast = document.createElement("div");
+  toast.className = "toast toast-warning toast-with-action";
+  const span = document.createElement("span");
+  span.textContent = message;
+  const btn = document.createElement("button");
+  btn.className = "toast-undo-btn";
+  btn.textContent = "Undo";
+  toast.appendChild(span);
+  toast.appendChild(btn);
+  container.appendChild(toast);
+  requestAnimationFrame(() => requestAnimationFrame(() => toast.classList.add("toast-visible")));
+  let dismissed = false;
+  const dismiss = () => {
+    if (dismissed) return;
+    dismissed = true;
+    toast.classList.remove("toast-visible");
+    toast.classList.add("toast-out");
+    setTimeout(() => toast.remove(), 400);
+  };
+  const timer = setTimeout(dismiss, 8000);
+  btn.addEventListener("click", () => {
+    clearTimeout(timer);
+    dismiss();
+    onUndo();
+  });
 }
