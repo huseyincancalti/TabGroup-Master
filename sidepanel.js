@@ -589,27 +589,6 @@ function renderSavedPane() {
   const frag = document.createDocumentFragment();
   inbox.forEach((group, index) => frag.appendChild(createSavedCard(group, index)));
 
-  // ── Folder sections: categorized (foldered) inactive groups, grouped ────────
-  // Keeps categorized groups visible in the panel instead of vanishing into the
-  // Dashboard. Active groups still live in the Active tab (with a 📁 tag).
-  const folders = (state.folders || []).slice().sort((a, b) => (a.name || "").localeCompare(b.name || ""));
-  for (const f of folders) {
-    const members = state.savedGroups
-      .filter((g) => !g.active && g.folderId === f.id)
-      .filter((g) => groupMatchesSearch(g, state.searchQuery));
-    if (!members.length) continue;
-
-    const section = document.createElement("div");
-    section.className = "saved-folder-section";
-    const header = document.createElement("div");
-    header.className = "saved-folder-header";
-    header.innerHTML = `<span class="saved-folder-name">📁 ${escHtml(f.name || "Folder")}</span>
-      <span class="saved-folder-count">${members.length}</span>`;
-    section.appendChild(header);
-    members.forEach((group, index) => section.appendChild(createSavedCard(group, index)));
-    frag.appendChild(section);
-  }
-
   container.innerHTML = "";
   container.appendChild(frag);
 }

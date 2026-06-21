@@ -202,6 +202,25 @@ async function setStore(partial) {
   scheduleFileBackup();
 }
 
+// ── Store mutation lock ──────────────────────────────────────────────────────
+// CRITICAL for data integrity. getStore() returns a fresh copy and setStore()
+// writes wholesale, so two concurrent read-modify-write sequences clobber each
+// other (last writer wins). The frequent offender is reconcile, which fires on
+// every tab event for active groups: it reads a copy, updates active flags, and
+// writes the whole array back — silently undoing a "move to folder" (folderId)
+// or a delete that happened in between. Every read-modify-write on savedGroups
+// MUST run inside withStoreLock so they execute strictly one-at-a-time.
+//
+// Deadlock rule: code already holding the lock must NEVER await another
+// lock-acquiring path. In particular, restoreGroup() calls reconcile() (which
+// locks), so restoreGroup itself is intentionally NOT wrapped.
+let _storeWriteChain = Promise.resolve();
+function withStoreLock(fn) {
+  const run = _storeWriteChain.then(fn, fn);
+  _storeWriteChain = run.then(() => {}, () => {});
+  return run;
+}
+
 // ── Active-window tab tracking ────────────────────────────────────────────────
 // Maps windowId → { groupUid, tabs: [{id, url, title}] }
 // Built when restoreGroup (freeMode) opens a window; kept live as tabs change.
@@ -551,6 +570,7 @@ async function reconcile() {
 // additionally skips 0-tab groups, tombstoned (deleted) groups, and anything
 // already represented in the store. Bulk import from Chrome stays explicit.
 async function reconcileInner() {
+  return withStoreLock(async () => {
   const store = await getStore();
   const live = await snapshotLiveGroups();
   const liveById = new Map(live.map((g) => [g.chromeGroupId, g]));
@@ -675,6 +695,7 @@ async function reconcileInner() {
     await setStore({ savedGroups: groups });
     broadcast({ type: "STORE_UPDATED" });
   }
+  });
 }
 
 const NATIVE_INSTALL_HINT =
@@ -798,32 +819,34 @@ async function importFromChrome(profileDirs = null) {
 
 async function importStore(data) {
   if (!data || typeof data !== "object") return { added: 0 };
-  const store = await getStore();
-  const incomingFolders = Array.isArray(data.folders) ? data.folders : [];
-  const incomingGroups = Array.isArray(data.savedGroups) ? data.savedGroups : [];
+  return withStoreLock(async () => {
+    const store = await getStore();
+    const incomingFolders = Array.isArray(data.folders) ? data.folders : [];
+    const incomingGroups = Array.isArray(data.savedGroups) ? data.savedGroups : [];
 
-  const folderIds = new Set(store.folders.map((f) => f.id));
-  for (const folder of incomingFolders) {
-    if (folder?.id && !folderIds.has(folder.id)) {
-      store.folders.push(normalizeFolder(folder));
-      folderIds.add(folder.id);
+    const folderIds = new Set(store.folders.map((f) => f.id));
+    for (const folder of incomingFolders) {
+      if (folder?.id && !folderIds.has(folder.id)) {
+        store.folders.push(normalizeFolder(folder));
+        folderIds.add(folder.id);
+      }
     }
-  }
 
-  const dedupKey = (g) => normalizeTitle(g?.title) || (g?.tabs?.[0]?.url || "");
-  const seen = new Set(store.savedGroups.map(dedupKey));
-  let added = 0;
-  for (const group of incomingGroups) {
-    const key = dedupKey(group);
-    if (key && seen.has(key)) continue;
-    store.savedGroups.push(normalizeGroup({ ...group, uid: uid(), active: false, chromeGroupId: null }));
-    if (key) seen.add(key);
-    added++;
-  }
+    const dedupKey = (g) => normalizeTitle(g?.title) || (g?.tabs?.[0]?.url || "");
+    const seen = new Set(store.savedGroups.map(dedupKey));
+    let added = 0;
+    for (const group of incomingGroups) {
+      const key = dedupKey(group);
+      if (key && seen.has(key)) continue;
+      store.savedGroups.push(normalizeGroup({ ...group, uid: uid(), active: false, chromeGroupId: null }));
+      if (key) seen.add(key);
+      added++;
+    }
 
-  await setStore({ savedGroups: store.savedGroups, folders: store.folders });
-  broadcast({ type: "STORE_UPDATED" });
-  return { added };
+    await setStore({ savedGroups: store.savedGroups, folders: store.folders });
+    broadcast({ type: "STORE_UPDATED" });
+    return { added };
+  });
 }
 
 // ── Service worker keepalive ──────────────────────────────────────────────────
@@ -846,24 +869,26 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
   _activeWindows.delete(windowId);
   _awPersist();
 
-  const store = await getStore();
-  let changed = false;
-  for (const g of store.savedGroups) {
-    if (g.openWindowId !== windowId) continue;
-    if (tracked?.tabs.length) {
-      // Normal path: in-memory tracking was intact.
-      g.tabs = tracked.tabs.map(({ url, title }) => ({ url, title }));
-      g.tabCount = g.tabs.length;
-      g.tabsLoaded = true;
+  await withStoreLock(async () => {
+    const store = await getStore();
+    let changed = false;
+    for (const g of store.savedGroups) {
+      if (g.openWindowId !== windowId) continue;
+      if (tracked?.tabs.length) {
+        // Normal path: in-memory tracking was intact.
+        g.tabs = tracked.tabs.map(({ url, title }) => ({ url, title }));
+        g.tabCount = g.tabs.length;
+        g.tabsLoaded = true;
+      }
+      // If tracked is empty (SW was idle and session restore had no entry):
+      // g.tabs was already written on every individual tab-close, so we keep
+      // the existing storage value — just flip the active flags.
+      g.active = false;
+      g.openWindowId = null;
+      changed = true;
     }
-    // If tracked is empty (SW was idle and session restore had no entry):
-    // g.tabs was already written on every individual tab-close (Fix 3 below),
-    // so we keep the existing storage value — just flip the active flags.
-    g.active = false;
-    g.openWindowId = null;
-    changed = true;
-  }
-  if (changed) await setStore({ savedGroups: store.savedGroups });
+    if (changed) await setStore({ savedGroups: store.savedGroups });
+  });
 });
 
 chrome.tabGroups.onCreated.addListener(scheduleReconcile);
@@ -881,14 +906,16 @@ chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
       if (idx >= 0) {
         data.tabs.splice(idx, 1);
         _awPersist();
-        const store = await getStore();
-        const g = store.savedGroups.find(sg => sg.uid === data.groupUid);
-        if (g) {
-          g.tabs = data.tabs.map(({ url, title }) => ({ url, title }));
-          g.tabCount = g.tabs.length;
-          g.tabsLoaded = true;
-          await setStore({ savedGroups: store.savedGroups });
-        }
+        await withStoreLock(async () => {
+          const store = await getStore();
+          const g = store.savedGroups.find(sg => sg.uid === data.groupUid);
+          if (g) {
+            g.tabs = data.tabs.map(({ url, title }) => ({ url, title }));
+            g.tabCount = g.tabs.length;
+            g.tabsLoaded = true;
+            await setStore({ savedGroups: store.savedGroups });
+          }
+        });
         break;
       }
     }
@@ -902,14 +929,16 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   if (data && tab.url && !tab.url.startsWith("chrome://") && !_isSuspended(tab.url)) {
     data.tabs.push({ id: tab.id, url: tab.url, title: tab.title || "" });
     _awPersist();
-    const store = await getStore();
-    const g = store.savedGroups.find(sg => sg.uid === data.groupUid);
-    if (g) {
-      g.tabs = data.tabs.map(({ url, title }) => ({ url, title }));
-      g.tabCount = g.tabs.length;
-      g.tabsLoaded = true;
-      await setStore({ savedGroups: store.savedGroups });
-    }
+    await withStoreLock(async () => {
+      const store = await getStore();
+      const g = store.savedGroups.find(sg => sg.uid === data.groupUid);
+      if (g) {
+        g.tabs = data.tabs.map(({ url, title }) => ({ url, title }));
+        g.tabCount = g.tabs.length;
+        g.tabsLoaded = true;
+        await setStore({ savedGroups: store.savedGroups });
+      }
+    });
   }
   scheduleReconcile();
 });
@@ -937,14 +966,16 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
       _awPersist();
       // Write the full tab list immediately so navigation changes survive SW idle.
       try {
-        const store = await getStore();
-        const g = store.savedGroups.find(sg => sg.uid === changedData.groupUid);
-        if (g) {
-          g.tabs = changedData.tabs.map(({ url, title }) => ({ url, title }));
-          g.tabCount = g.tabs.length;
-          g.tabsLoaded = true;
-          await setStore({ savedGroups: store.savedGroups });
-        }
+        await withStoreLock(async () => {
+          const store = await getStore();
+          const g = store.savedGroups.find(sg => sg.uid === changedData.groupUid);
+          if (g) {
+            g.tabs = changedData.tabs.map(({ url, title }) => ({ url, title }));
+            g.tabCount = g.tabs.length;
+            g.tabsLoaded = true;
+            await setStore({ savedGroups: store.savedGroups });
+          }
+        });
       } catch (_) {}
     }
   }
@@ -1120,10 +1151,6 @@ const handlers = {
           await new Promise(r => setTimeout(r, 80));
         }
       }
-      group.active = true;
-      group.openWindowId = win.id;
-      group.chromeGroupId = null;
-
       // Seed the tracking map so tab changes (closes, navigations) are captured.
       const seedTabs = await chrome.tabs.query({ windowId: win.id });
       _activeWindows.set(win.id, {
@@ -1136,7 +1163,14 @@ const handlers = {
       });
       _awPersist();
 
-      await setStore({ savedGroups: store.savedGroups });
+      // Lock only the quick state write (NOT the slow batched tab opening above)
+      // and re-read fresh so a concurrent reconcile can't clobber it.
+      await withStoreLock(async () => {
+        const s = await getStore();
+        const g = s.savedGroups.find(x => x.uid === group.uid);
+        if (g) { g.active = true; g.openWindowId = win.id; g.chromeGroupId = null; }
+        await setStore({ savedGroups: s.savedGroups });
+      });
       broadcast({ type: "STORE_UPDATED" });
       return { ok: true, freeMode: true, lazy: useLazy, count: urls.length, windowId: win.id };
     }
@@ -1153,50 +1187,54 @@ const handlers = {
     }
     const chromeGroupId = await chrome.tabs.group({ tabIds, createProperties: { windowId: window.id } });
     await chrome.tabGroups.update(chromeGroupId, { title: group.title, color: group.color });
-    group.active = true;
-    group.chromeGroupId = chromeGroupId;
-    group.openWindowId = null;
-    await setStore({ savedGroups: store.savedGroups });
-    await reconcile();
+    await withStoreLock(async () => {
+      const s = await getStore();
+      const g = s.savedGroups.find(x => x.uid === group.uid);
+      if (g) { g.active = true; g.chromeGroupId = chromeGroupId; g.openWindowId = null; }
+      await setStore({ savedGroups: s.savedGroups });
+    });
+    scheduleReconcile();
     return { ok: true, freeMode: false, lazy: useLazy, count: tabIds.length };
   },
 
   // ── Close an open group (close its window or ungroup), keep it saved ─────────
   async closeGroup({ groupUid }) {
-    const store = await getStore();
-    const group = buildIndexes(store).groupsByUid.get(groupUid);
-    if (!group) return { ok: false };
+    return withStoreLock(async () => {
+      const store = await getStore();
+      const group = buildIndexes(store).groupsByUid.get(groupUid);
+      if (!group) return { ok: false };
 
-    if (group.openWindowId != null) {
-      // Save current tab state before closing the window
-      const tracked = _activeWindows.get(group.openWindowId);
-      if (tracked?.tabs.length) {
-        group.tabs = tracked.tabs.map(({ url, title }) => ({ url, title }));
-        group.tabCount = group.tabs.length;
-        group.tabsLoaded = true;
-      }
-      _activeWindows.delete(group.openWindowId);
-      _awPersist();
-      try { await chrome.windows.remove(group.openWindowId); } catch (_) {}
-    } else if (group.chromeGroupId != null) {
-      try {
-        // Save current tab state from the Chrome tab group before closing
-        const liveTabs = await readLiveTabs(group.chromeGroupId);
-        if (liveTabs.length) {
-          group.tabs = liveTabs;
-          group.tabCount = liveTabs.length;
+      if (group.openWindowId != null) {
+        // Save current tab state before closing the window
+        const tracked = _activeWindows.get(group.openWindowId);
+        if (tracked?.tabs.length) {
+          group.tabs = tracked.tabs.map(({ url, title }) => ({ url, title }));
+          group.tabCount = group.tabs.length;
           group.tabsLoaded = true;
         }
-        const tabIds = (await chrome.tabs.query({ groupId: group.chromeGroupId })).map(t => t.id).filter(Boolean);
-        if (tabIds.length) await chrome.tabs.remove(tabIds);
-      } catch (_) {}
-    }
-    group.active = false;
-    group.openWindowId = null;
-    group.chromeGroupId = null;
-    await setStore({ savedGroups: store.savedGroups });
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true };
+        _activeWindows.delete(group.openWindowId);
+        _awPersist();
+        try { await chrome.windows.remove(group.openWindowId); } catch (_) {}
+      } else if (group.chromeGroupId != null) {
+        try {
+          // Save current tab state from the Chrome tab group before closing
+          const liveTabs = await readLiveTabs(group.chromeGroupId);
+          if (liveTabs.length) {
+            group.tabs = liveTabs;
+            group.tabCount = liveTabs.length;
+            group.tabsLoaded = true;
+          }
+          const tabIds = (await chrome.tabs.query({ groupId: group.chromeGroupId })).map(t => t.id).filter(Boolean);
+          if (tabIds.length) await chrome.tabs.remove(tabIds);
+        } catch (_) {}
+      }
+      group.active = false;
+      group.openWindowId = null;
+      group.chromeGroupId = null;
+      await setStore({ savedGroups: store.savedGroups });
+      broadcast({ type: "STORE_UPDATED" });
+      return { ok: true };
+    });
   },
 
   // ── Bring an open group's window to the front ────────────────────────────────
@@ -1219,27 +1257,31 @@ const handlers = {
   },
 
   async deleteGroup({ groupUid }) {
-    const store = await getStore();
-    const removed = store.savedGroups.find((g) => g.uid === groupUid);
-    const savedGroups = store.savedGroups.filter((g) => g.uid !== groupUid);
-    if (removed) await addDeletedKeys([removed]); // remember it so import won't re-add it
-    await setStore({ savedGroups });
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true };
+    return withStoreLock(async () => {
+      const store = await getStore();
+      const removed = store.savedGroups.find((g) => g.uid === groupUid);
+      const savedGroups = store.savedGroups.filter((g) => g.uid !== groupUid);
+      if (removed) await addDeletedKeys([removed]); // remember it so import won't re-add it
+      await setStore({ savedGroups });
+      broadcast({ type: "STORE_UPDATED" });
+      return { ok: true };
+    });
   },
 
   async deduplicateGroupTabs({ groupUid }) {
-    const store = await getStore();
-    const group = buildIndexes(store).groupsByUid.get(groupUid);
-    if (!group) return { ok: false };
-    const tabs = group.tabs || [];
-    const removeIndices = findTabDuplicateIndices(tabs);
-    if (!removeIndices.length) return { ok: true, removed: 0, kept: tabs.length };
-    removeIndices.forEach(i => tabs.splice(i, 1));
-    group.tabCount = tabs.length;
-    await setStore({ savedGroups: store.savedGroups });
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true, removed: removeIndices.length, kept: tabs.length };
+    return withStoreLock(async () => {
+      const store = await getStore();
+      const group = buildIndexes(store).groupsByUid.get(groupUid);
+      if (!group) return { ok: false };
+      const tabs = group.tabs || [];
+      const removeIndices = findTabDuplicateIndices(tabs);
+      if (!removeIndices.length) return { ok: true, removed: 0, kept: tabs.length };
+      removeIndices.forEach(i => tabs.splice(i, 1));
+      group.tabCount = tabs.length;
+      await setStore({ savedGroups: store.savedGroups });
+      broadcast({ type: "STORE_UPDATED" });
+      return { ok: true, removed: removeIndices.length, kept: tabs.length };
+    });
   },
 
   async saveWindowAsGroup({ windowId, title }) {
@@ -1268,9 +1310,11 @@ const handlers = {
       openWindowId: windowId,
     });
 
-    const store = await getStore();
-    store.savedGroups.unshift(newGroup);
-    await setStore({ savedGroups: store.savedGroups });
+    await withStoreLock(async () => {
+      const store = await getStore();
+      store.savedGroups.unshift(newGroup);
+      await setStore({ savedGroups: store.savedGroups });
+    });
 
     // Seed tracking map — closing this window will auto-save final tab state
     _activeWindows.set(windowId, { groupUid: newGroup.uid, tabs });
@@ -1282,6 +1326,7 @@ const handlers = {
 
   async restoreDeletedGroup({ group }) {
     if (!group || !group.uid) return { ok: false };
+    return withStoreLock(async () => {
     const store = await getStore();
     if (store.savedGroups.some(g => g.uid === group.uid)) return { ok: true };
     store.savedGroups.unshift(normalizeGroup({ ...group, active: false, openWindowId: null, chromeGroupId: null }));
@@ -1289,42 +1334,48 @@ const handlers = {
     await setStore({ savedGroups: store.savedGroups });
     broadcast({ type: "STORE_UPDATED" });
     return { ok: true };
+    });
   },
 
   // Bulk undo for "Delete selected" — restores all snapshots in one storage write.
   async restoreDeletedGroups({ groups }) {
     if (!Array.isArray(groups) || !groups.length) return { ok: false };
-    const store = await getStore();
-    const existing = new Set(store.savedGroups.map(g => g.uid));
-    let restored = 0;
-    for (const group of groups) {
-      if (!group?.uid || existing.has(group.uid)) continue;
-      store.savedGroups.unshift(normalizeGroup({ ...group, active: false, openWindowId: null, chromeGroupId: null }));
-      existing.add(group.uid);
-      restored++;
-    }
-    if (restored) {
-      await removeDeletedKeys(groups); // undo: clear their tombstones
-      await setStore({ savedGroups: store.savedGroups });
-      broadcast({ type: "STORE_UPDATED" });
-    }
-    return { ok: true, restored };
+    return withStoreLock(async () => {
+      const store = await getStore();
+      const existing = new Set(store.savedGroups.map(g => g.uid));
+      let restored = 0;
+      for (const group of groups) {
+        if (!group?.uid || existing.has(group.uid)) continue;
+        store.savedGroups.unshift(normalizeGroup({ ...group, active: false, openWindowId: null, chromeGroupId: null }));
+        existing.add(group.uid);
+        restored++;
+      }
+      if (restored) {
+        await removeDeletedKeys(groups); // undo: clear their tombstones
+        await setStore({ savedGroups: store.savedGroups });
+        broadcast({ type: "STORE_UPDATED" });
+      }
+      return { ok: true, restored };
+    });
   },
 
   async updateGroupTitle({ groupUid, title }) {
-    const store = await getStore();
-    const group = buildIndexes(store).groupsByUid.get(groupUid);
-    if (!group) return { ok: false };
-    group.title = title;
-    if (group.active && group.chromeGroupId != null) {
-      await chrome.tabGroups.update(group.chromeGroupId, { title }).catch(() => {});
-    }
-    await setStore({ savedGroups: store.savedGroups });
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true };
+    return withStoreLock(async () => {
+      const store = await getStore();
+      const group = buildIndexes(store).groupsByUid.get(groupUid);
+      if (!group) return { ok: false };
+      group.title = title;
+      if (group.active && group.chromeGroupId != null) {
+        await chrome.tabGroups.update(group.chromeGroupId, { title }).catch(() => {});
+      }
+      await setStore({ savedGroups: store.savedGroups });
+      broadcast({ type: "STORE_UPDATED" });
+      return { ok: true };
+    });
   },
 
   async updateGroupColor({ groupUid, color }) {
+    return withStoreLock(async () => {
     const store = await getStore();
     const group = buildIndexes(store).groupsByUid.get(groupUid);
     if (!group) return { ok: false };
@@ -1335,6 +1386,7 @@ const handlers = {
     await setStore({ savedGroups: store.savedGroups });
     broadcast({ type: "STORE_UPDATED" });
     return { ok: true };
+    });
   },
 
   async createFolder({ name, parentId }) {
@@ -1380,74 +1432,83 @@ const handlers = {
   },
 
   async moveItem({ itemType, itemId, targetFolderId }) {
-    const store = await getStore();
-    const indexes = buildIndexes(store);
-    const newParent = targetFolderId || null;
+    return withStoreLock(async () => {
+      const store = await getStore();
+      const indexes = buildIndexes(store);
+      const newParent = targetFolderId || null;
 
-    if (itemType === "folder") {
-      const folder = indexes.foldersById.get(itemId);
-      if (!folder || newParent === folder.id) return { ok: false };
-      let ancestor = newParent;
-      while (ancestor) {
-        if (ancestor === folder.id) return { ok: false };
-        ancestor = indexes.foldersById.get(ancestor)?.parentId ?? null;
+      if (itemType === "folder") {
+        const folder = indexes.foldersById.get(itemId);
+        if (!folder || newParent === folder.id) return { ok: false };
+        let ancestor = newParent;
+        while (ancestor) {
+          if (ancestor === folder.id) return { ok: false };
+          ancestor = indexes.foldersById.get(ancestor)?.parentId ?? null;
+        }
+        folder.parentId = newParent;
+        await setStore({ folders: store.folders });
+      } else if (itemType === "group") {
+        const group = indexes.groupsByUid.get(itemId);
+        if (!group) return { ok: false };
+        group.folderId = newParent;
+        await setStore({ savedGroups: store.savedGroups });
+      } else {
+        return { ok: false };
       }
-      folder.parentId = newParent;
-      await setStore({ folders: store.folders });
-    } else if (itemType === "group") {
-      const group = indexes.groupsByUid.get(itemId);
-      if (!group) return { ok: false };
-      group.folderId = newParent;
-      await setStore({ savedGroups: store.savedGroups });
-    } else {
-      return { ok: false };
-    }
 
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true };
+      broadcast({ type: "STORE_UPDATED" });
+      return { ok: true };
+    });
   },
 
   async removeGroupFromFolder({ groupUid }) {
-    const store = await getStore();
-    const group = buildIndexes(store).groupsByUid.get(groupUid);
-    if (!group) return { ok: false };
-    group.folderId = null;
-    await setStore({ savedGroups: store.savedGroups });
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true };
+    return withStoreLock(async () => {
+      const store = await getStore();
+      const group = buildIndexes(store).groupsByUid.get(groupUid);
+      if (!group) return { ok: false };
+      group.folderId = null;
+      await setStore({ savedGroups: store.savedGroups });
+      broadcast({ type: "STORE_UPDATED" });
+      return { ok: true };
+    });
   },
 
   async mergeGroups({ keepUid, mergeUid }) {
-    const store = await getStore();
-    const idx = buildIndexes(store);
-    const keep = idx.groupsByUid.get(keepUid);
-    const merge = idx.groupsByUid.get(mergeUid);
-    if (!keep || !merge) return { ok: false };
-    const seen = new Set((keep.tabs || []).map((t) => t.url).filter(Boolean));
-    for (const tab of (merge.tabs || [])) {
-      if (tab.url && !seen.has(tab.url)) {
-        keep.tabs.push(tab);
-        seen.add(tab.url);
+    return withStoreLock(async () => {
+      const store = await getStore();
+      const idx = buildIndexes(store);
+      const keep = idx.groupsByUid.get(keepUid);
+      const merge = idx.groupsByUid.get(mergeUid);
+      if (!keep || !merge) return { ok: false };
+      const seen = new Set((keep.tabs || []).map((t) => t.url).filter(Boolean));
+      for (const tab of (merge.tabs || [])) {
+        if (tab.url && !seen.has(tab.url)) {
+          keep.tabs.push(tab);
+          seen.add(tab.url);
+        }
       }
-    }
-    keep.tabCount = keep.tabs.length;
-    keep.tabsLoaded = true;
-    store.savedGroups = store.savedGroups.filter((g) => g.uid !== mergeUid);
-    await setStore({ savedGroups: store.savedGroups });
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true };
+      keep.tabCount = keep.tabs.length;
+      keep.tabsLoaded = true;
+      store.savedGroups = store.savedGroups.filter((g) => g.uid !== mergeUid);
+      await addDeletedKeys([merge]); // remember the merged-away group so import won't re-add
+      await setStore({ savedGroups: store.savedGroups });
+      broadcast({ type: "STORE_UPDATED" });
+      return { ok: true };
+    });
   },
 
   async deleteMultipleGroups({ groupUids }) {
     if (!Array.isArray(groupUids) || !groupUids.length) return { ok: false };
-    const toDelete = new Set(groupUids);
-    const store = await getStore();
-    const removed = store.savedGroups.filter((g) => toDelete.has(g.uid));
-    const savedGroups = store.savedGroups.filter((g) => !toDelete.has(g.uid));
-    if (removed.length) await addDeletedKeys(removed); // remember them so import won't re-add
-    await setStore({ savedGroups });
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true, deleted: groupUids.length };
+    return withStoreLock(async () => {
+      const toDelete = new Set(groupUids);
+      const store = await getStore();
+      const removed = store.savedGroups.filter((g) => toDelete.has(g.uid));
+      const savedGroups = store.savedGroups.filter((g) => !toDelete.has(g.uid));
+      if (removed.length) await addDeletedKeys(removed); // remember them so import won't re-add
+      await setStore({ savedGroups });
+      broadcast({ type: "STORE_UPDATED" });
+      return { ok: true, deleted: groupUids.length };
+    });
   },
 
   async importJson({ data }) {
@@ -1458,50 +1519,56 @@ const handlers = {
 
   // ── Create a brand-new group (from scratch, no open Chrome tabs needed) ──────
   async createGroup({ title, color, tabs }) {
-    const store = await getStore();
-    const newGroup = normalizeGroup({
-      title: (title || "").trim() || "New Group",
-      color: color || "grey",
-      tabs: (tabs || [])
-        .map(t => ({ url: (t.url || "").trim(), title: (t.title || t.url || "").trim() }))
-        .filter(t => t.url),
-      active: false,
-      chromeGroupId: null,
-      folderId: null,
-      savedAt: Date.now(),
+    return withStoreLock(async () => {
+      const store = await getStore();
+      const newGroup = normalizeGroup({
+        title: (title || "").trim() || "New Group",
+        color: color || "grey",
+        tabs: (tabs || [])
+          .map(t => ({ url: (t.url || "").trim(), title: (t.title || t.url || "").trim() }))
+          .filter(t => t.url),
+        active: false,
+        chromeGroupId: null,
+        folderId: null,
+        savedAt: Date.now(),
+      });
+      store.savedGroups.push(newGroup);
+      await setStore({ savedGroups: store.savedGroups });
+      broadcast({ type: "STORE_UPDATED" });
+      return { ok: true, group: newGroup };
     });
-    store.savedGroups.push(newGroup);
-    await setStore({ savedGroups: store.savedGroups });
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true, group: newGroup };
   },
 
   // ── Replace the tab list for an existing saved group ─────────────────────────
   async updateGroupTabs({ groupUid, tabs }) {
-    const store = await getStore();
-    const group = buildIndexes(store).groupsByUid.get(groupUid);
-    if (!group) return { ok: false };
-    group.tabs = (tabs || [])
-      .map(t => ({ url: (t.url || "").trim(), title: (t.title || t.url || "").trim() }))
-      .filter(t => t.url);
-    group.tabCount = group.tabs.length;
-    group.tabsLoaded = true;
-    await setStore({ savedGroups: store.savedGroups });
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true };
+    return withStoreLock(async () => {
+      const store = await getStore();
+      const group = buildIndexes(store).groupsByUid.get(groupUid);
+      if (!group) return { ok: false };
+      group.tabs = (tabs || [])
+        .map(t => ({ url: (t.url || "").trim(), title: (t.title || t.url || "").trim() }))
+        .filter(t => t.url);
+      group.tabCount = group.tabs.length;
+      group.tabsLoaded = true;
+      await setStore({ savedGroups: store.savedGroups });
+      broadcast({ type: "STORE_UPDATED" });
+      return { ok: true };
+    });
   },
 
   // ── Persist a user-defined ordering for savedGroups (drag-and-drop) ──────────
   async reorderGroups({ orderedUids }) {
     if (!Array.isArray(orderedUids)) return { ok: false };
-    const store = await getStore();
-    const byUid = new Map(store.savedGroups.map(g => [g.uid, g]));
-    const reordered = orderedUids.map(u => byUid.get(u)).filter(Boolean);
-    const reorderedSet = new Set(orderedUids);
-    const rest = store.savedGroups.filter(g => !reorderedSet.has(g.uid));
-    await setStore({ savedGroups: [...reordered, ...rest] });
-    broadcast({ type: "STORE_UPDATED" });
-    return { ok: true };
+    return withStoreLock(async () => {
+      const store = await getStore();
+      const byUid = new Map(store.savedGroups.map(g => [g.uid, g]));
+      const reordered = orderedUids.map(u => byUid.get(u)).filter(Boolean);
+      const reorderedSet = new Set(orderedUids);
+      const rest = store.savedGroups.filter(g => !reorderedSet.has(g.uid));
+      await setStore({ savedGroups: [...reordered, ...rest] });
+      broadcast({ type: "STORE_UPDATED" });
+      return { ok: true };
+    });
   },
 
   async getSettings() {
