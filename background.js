@@ -541,15 +541,15 @@ async function reconcile() {
 }
 
 // Reconcile keeps the saved store's ACTIVE/INACTIVE state in sync with what's
-// really open in the browser. It deliberately does NOT capture or import any
-// groups — groups only ever enter the store through an explicit user action
-// (Save This Window, Import from Chrome, New Group, undo a delete).
+// really open in the browser, and surfaces native Chrome tab groups the user
+// creates so they appear in Active automatically (Pass 2 below).
 //
-// Why no auto-capture: Chrome itself syncs your native tab groups across every
-// device/profile signed into the same Google account. Auto-capturing whatever
-// looked "live" pulled those in too — creating duplicate, tab-less ghost groups
-// on every launch, seemingly "from all my accounts". (User-reported critical
-// bug.) The Active tab now shows only groups TabGroup Master itself opened.
+// What it must NEVER do: pull in the synced/closed ghost groups from other
+// accounts. Those came from the LevelDB native IMPORT path, never from the
+// live chrome.tabGroups API. chrome.tabGroups.query returns only groups that
+// are physically open in this session, so live capture is safe — and Pass 2
+// additionally skips 0-tab groups, tombstoned (deleted) groups, and anything
+// already represented in the store. Bulk import from Chrome stays explicit.
 async function reconcileInner() {
   const store = await getStore();
   const live = await snapshotLiveGroups();
@@ -607,6 +607,66 @@ async function reconcileInner() {
         g.tabsLoaded = true;
       }
     }
+  }
+
+  // ── Pass 2: surface live Chrome tab groups the user created natively ─────────
+  // chrome.tabGroups.query (inside snapshotLiveGroups) returns ONLY groups that
+  // are physically open in the current session — never the synced/closed ghost
+  // groups from other accounts that caused the old data-loss (those came from
+  // the LevelDB native import, not this live API). Guards keep it safe:
+  //   • skip groups with 0 real tabs (the "ghost" shape from sync remnants)
+  //   • skip groups already mapped to a saved group (by chromeGroupId)
+  //   • re-link an existing INACTIVE saved group instead of duplicating it
+  //   • skip groups the user deleted (tombstones)
+  const mappedChromeIds = new Set(groups.filter(g => g.chromeGroupId != null).map(g => g.chromeGroupId));
+  const savedBySig = new Map();
+  for (const g of groups) {
+    const s = groupSignature(g);
+    if (s && !savedBySig.has(s)) savedBySig.set(s, g);
+  }
+  const deleted = await getDeletedKeys();
+  const capturedSigs = new Set();
+
+  for (const lg of live) {
+    if (!lg.tabs || lg.tabs.length === 0) continue;          // ghost guard
+    if (mappedChromeIds.has(lg.chromeGroupId)) continue;     // already tracked
+    const lsig = groupSignature(lg);
+
+    const existing = lsig ? savedBySig.get(lsig) : null;
+    if (existing) {
+      // A saved group with this identity already exists.
+      if (!existing.active && existing.openWindowId == null) {
+        // It was closed/inactive — the user just re-opened it natively. Re-link.
+        existing.chromeGroupId = lg.chromeGroupId;
+        existing.active = true;
+        existing.title = lg.title || existing.title;
+        existing.color = lg.color || existing.color;
+        existing.tabs = lg.tabs;
+        existing.tabCount = lg.tabs.length;
+        existing.tabsLoaded = true;
+        mappedChromeIds.add(lg.chromeGroupId);
+      }
+      continue; // already represented — never duplicate
+    }
+
+    if (lsig && deleted.has(lsig)) continue;                 // user deleted it
+    if (lsig && capturedSigs.has(lsig)) continue;            // dedupe within this pass
+
+    // Brand-new native group → capture it as an active saved group.
+    const captured = normalizeGroup({
+      uid: uid(),
+      title: lg.title || "",
+      color: lg.color || "grey",
+      tabs: lg.tabs,
+      tabCount: lg.tabs.length,
+      tabsLoaded: true,
+      active: true,
+      chromeGroupId: lg.chromeGroupId,
+      openWindowId: null,
+    });
+    groups.push(captured);
+    mappedChromeIds.add(lg.chromeGroupId);
+    if (lsig) { savedBySig.set(lsig, captured); capturedSigs.add(lsig); }
   }
 
   // Only persist + broadcast if something actually changed (avoids spurious
