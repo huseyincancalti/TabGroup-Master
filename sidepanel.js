@@ -299,6 +299,7 @@ function buildGroupCardHTML(group) {
       ${trackingBadge}
     </div>
     <div class="group-actions">
+      ${moveBtnHTML()}
       <button class="edit-group-btn" type="button" title="Edit group">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/>
@@ -322,9 +323,87 @@ function buildGroupCardHTML(group) {
     </div>`;
 }
 
+// ── Move to folder (categorize) — works on active and inbox groups ───────────
+function moveBtnHTML() {
+  return `<button class="move-group-btn" type="button" title="Move to folder">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+      </svg>
+    </button>`;
+}
+
+let _moveMenuEl = null;
+function closeMoveMenu() {
+  if (_moveMenuEl) { _moveMenuEl.remove(); _moveMenuEl = null; }
+  document.removeEventListener("click", closeMoveMenu, true);
+}
+
+function openMoveMenu(group, anchorEl) {
+  closeMoveMenu();
+  const menu = document.createElement("div");
+  menu.className = "move-menu";
+
+  const mkItem = (label, isCurrent, onClick) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "move-menu-item" + (isCurrent ? " current" : "");
+    b.textContent = label;
+    b.addEventListener("click", (e) => { e.stopPropagation(); closeMoveMenu(); onClick(); });
+    return b;
+  };
+
+  // "Inbox" = remove from any folder
+  menu.appendChild(mkItem("📥 Inbox (no folder)", group.folderId == null, async () => {
+    const g = state.groupIndex.get(group.uid);
+    if (g) g.folderId = null;
+    await sendMsg({ action: "removeGroupFromFolder", groupUid: group.uid });
+    await loadData(); render();
+    showToast("Moved to Inbox", "success");
+  }));
+
+  const folders = (state.folders || []).slice().sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  if (!folders.length) {
+    const hint = document.createElement("div");
+    hint.className = "move-menu-empty";
+    hint.textContent = "No folders yet — create them in the Dashboard.";
+    menu.appendChild(hint);
+  } else {
+    for (const f of folders) {
+      menu.appendChild(mkItem("📁 " + (f.name || "Folder"), group.folderId === f.id, async () => {
+        const g = state.groupIndex.get(group.uid);
+        if (g) g.folderId = f.id;
+        await sendMsg({ action: "moveItem", itemType: "group", itemId: group.uid, targetFolderId: f.id });
+        await loadData(); render();
+        showToast(`Moved to "${f.name}"`, "success");
+      }));
+    }
+  }
+
+  document.body.appendChild(menu);
+  _moveMenuEl = menu;
+  // Position under the anchor, clamped to viewport.
+  const r = anchorEl.getBoundingClientRect();
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  let left = Math.min(r.left, window.innerWidth - mw - 8);
+  let top = r.bottom + 4;
+  if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 4);
+  menu.style.left = Math.max(8, left) + "px";
+  menu.style.top = top + "px";
+  // Defer so this opening click doesn't immediately close it.
+  setTimeout(() => document.addEventListener("click", closeMoveMenu, true), 0);
+}
+
+function bindMoveButton(card, group) {
+  card.querySelector(".move-group-btn")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openMoveMenu(group, e.currentTarget);
+  });
+}
+
 function bindActiveCardActions(card, group) {
   if (state.selectionMode) { bindSelectable(card, group); return; }
   bindTabCountExpand(card, group);
+  bindMoveButton(card, group);
 
   // Clicking the card body brings the group's open window to the front.
   card.querySelector(".group-info")?.addEventListener("click", (e) => {
@@ -376,6 +455,130 @@ function updateSavedEmptyState() {
   document.getElementById("empty-saved")?.classList.toggle("hidden", getInboxGroups().length > 0);
 }
 
+function createSavedCard(group, index) {
+  const dot = COLOR_HEX[group.color] || COLOR_HEX.grey;
+  const title = highlightTitle(group.title, state.searchQuery);
+  const tabCount = getGroupTabCount(group);
+
+  const card = document.createElement("div");
+  card.className = "group-card saved-group-card animate-in"
+    + (state.selectionMode ? " selecting" : "")
+    + (state.selectedUids.has(group.uid) ? " selected" : "");
+  card.dataset.groupUid = group.uid;
+  card.draggable = !state.selectionMode;
+  card.style.animationDelay = `${index * 40}ms`;
+  const unst = group.tabsUnstored ? ` <span class="unstored-badge">· sync only</span>` : "";
+  const sel = state.selectionMode
+    ? `<input type="checkbox" class="card-select-check" ${state.selectedUids.has(group.uid) ? "checked" : ""} aria-label="Select group" />`
+    : "";
+  card.innerHTML = `
+    ${sel}
+    <span class="drag-handle" title="Drag to reorder">⠿</span>
+    <span class="group-color-dot" style="background:${dot}"></span>
+    <div class="group-info">
+      <div class="group-title">${title}</div>
+      <div class="group-tab-count">${tabCount} tab${tabCount !== 1 ? "s" : ""}${unst}${group.savedAt ? ` <span class="group-saved-at">· ${timeAgo(group.savedAt)}</span>` : ""}</div>
+    </div>
+    <div class="group-actions">
+      ${moveBtnHTML()}
+      <button class="edit-group-btn" type="button" title="Edit group">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/>
+          <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/>
+        </svg>
+      </button>
+      <button class="restore-btn" type="button" title="Open in Chrome">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="1 4 1 10 7 10"/>
+          <path d="M3.51 15a9 9 0 102.13-9.36L1 10"/>
+        </svg>
+      </button>
+      <button class="delete-btn" type="button" title="Delete group">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="3 6 5 6 21 6"/>
+          <path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
+          <path d="M10 11v6M14 11v6"/>
+          <path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/>
+        </svg>
+      </button>
+    </div>`;
+
+  if (state.selectionMode) {
+    bindSelectable(card, group);
+    return card;
+  }
+
+  bindMoveButton(card, group);
+
+  card.querySelector(".edit-group-btn").addEventListener("click", (e) => {
+    e.stopPropagation();
+    openEditModal(group);
+  });
+
+  card.querySelector(".restore-btn").addEventListener("click", async () => {
+    const res = await sendMsg({ action: "restoreGroup", groupUid: group.uid });
+    if (res?.ok) showToast("Group opened in Chrome", "success");
+    else showToast(res?.error || "Could not restore group", "error");
+  });
+
+  card.querySelector(".delete-btn").addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const name = group.title || "Unnamed Group";
+    const count = group.tabCount || (group.tabs || []).length || 0;
+    const ok = await showModal({
+      title: `Delete "${name}"?`,
+      body: `Removes ${count} tab${count !== 1 ? "s" : ""} from your saved groups. Your browser tabs are unaffected.`,
+      confirmText: "Delete", danger: true,
+    });
+    if (!ok) return;
+    const groupSnapshot = { ...group, tabs: [...(group.tabs || [])] };
+    card.remove();
+    state.savedGroups = state.savedGroups.filter((g) => g.uid !== group.uid);
+    buildIndexes();
+    updateSavedEmptyState();
+    sendMsg({ action: "deleteGroup", groupUid: group.uid });
+    showUndoToast(`"${name}" deleted`, () => {
+      sendMsg({ action: "restoreDeletedGroup", group: groupSnapshot });
+    });
+  });
+
+  // ── Drag-and-drop reordering ──────────────────────────────────────────────
+  card.addEventListener("dragstart", (e) => {
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", group.uid);
+    setTimeout(() => card.classList.add("dragging"), 0);
+  });
+  card.addEventListener("dragend", () => card.classList.remove("dragging"));
+  card.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    card.classList.add("drag-over");
+  });
+  card.addEventListener("dragleave", (e) => {
+    if (!card.contains(e.relatedTarget)) card.classList.remove("drag-over");
+  });
+  card.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    card.classList.remove("drag-over");
+    const dragUid = e.dataTransfer.getData("text/plain");
+    if (!dragUid || dragUid === group.uid) return;
+
+    const dragIdx = state.savedGroups.findIndex(g => g.uid === dragUid);
+    const dropIdx = state.savedGroups.findIndex(g => g.uid === group.uid);
+    if (dragIdx === -1 || dropIdx === -1) return;
+
+    const [moved] = state.savedGroups.splice(dragIdx, 1);
+    const newDrop  = state.savedGroups.findIndex(g => g.uid === group.uid);
+    state.savedGroups.splice(newDrop, 0, moved);
+    buildIndexes();
+    renderSavedPane();
+    sendMsg({ action: "reorderGroups", orderedUids: state.savedGroups.map(g => g.uid) });
+  });
+
+  bindTabCountExpand(card, group);
+  return card;
+}
+
 function renderSavedPane() {
   const container = document.getElementById("saved-groups-list");
   if (!container) return;
@@ -384,128 +587,28 @@ function renderSavedPane() {
   updateSavedEmptyState();
 
   const frag = document.createDocumentFragment();
-  inbox.forEach((group, index) => {
-    const dot = COLOR_HEX[group.color] || COLOR_HEX.grey;
-    const title = highlightTitle(group.title, state.searchQuery);
-    const tabCount = getGroupTabCount(group);
+  inbox.forEach((group, index) => frag.appendChild(createSavedCard(group, index)));
 
-    const card = document.createElement("div");
-    card.className = "group-card saved-group-card animate-in"
-      + (state.selectionMode ? " selecting" : "")
-      + (state.selectedUids.has(group.uid) ? " selected" : "");
-    card.dataset.groupUid = group.uid;
-    card.draggable = !state.selectionMode;
-    card.style.animationDelay = `${index * 40}ms`;
-    const unst = group.tabsUnstored ? ` <span class="unstored-badge">· sync only</span>` : "";
-    const sel = state.selectionMode
-      ? `<input type="checkbox" class="card-select-check" ${state.selectedUids.has(group.uid) ? "checked" : ""} aria-label="Select group" />`
-      : "";
-    card.innerHTML = `
-      ${sel}
-      <span class="drag-handle" title="Drag to reorder">⠿</span>
-      <span class="group-color-dot" style="background:${dot}"></span>
-      <div class="group-info">
-        <div class="group-title">${title}</div>
-        <div class="group-tab-count">${tabCount} tab${tabCount !== 1 ? "s" : ""}${unst}${group.savedAt ? ` <span class="group-saved-at">· ${timeAgo(group.savedAt)}</span>` : ""}</div>
-      </div>
-      <div class="group-actions">
-        <button class="edit-group-btn" type="button" title="Edit group">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/>
-            <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/>
-          </svg>
-        </button>
-        <button class="restore-btn" type="button" title="Open in Chrome">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="1 4 1 10 7 10"/>
-            <path d="M3.51 15a9 9 0 102.13-9.36L1 10"/>
-          </svg>
-        </button>
-        <button class="delete-btn" type="button" title="Delete group">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="3 6 5 6 21 6"/>
-            <path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
-            <path d="M10 11v6M14 11v6"/>
-            <path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/>
-          </svg>
-        </button>
-      </div>`;
+  // ── Folder sections: categorized (foldered) inactive groups, grouped ────────
+  // Keeps categorized groups visible in the panel instead of vanishing into the
+  // Dashboard. Active groups still live in the Active tab (with a 📁 tag).
+  const folders = (state.folders || []).slice().sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  for (const f of folders) {
+    const members = state.savedGroups
+      .filter((g) => !g.active && g.folderId === f.id)
+      .filter((g) => groupMatchesSearch(g, state.searchQuery));
+    if (!members.length) continue;
 
-    if (state.selectionMode) {
-      bindSelectable(card, group);
-      frag.appendChild(card);
-      return;
-    }
-
-    card.querySelector(".edit-group-btn").addEventListener("click", (e) => {
-      e.stopPropagation();
-      openEditModal(group);
-    });
-
-    card.querySelector(".restore-btn").addEventListener("click", async () => {
-      const res = await sendMsg({ action: "restoreGroup", groupUid: group.uid });
-      if (res?.ok) showToast("Group opened in Chrome", "success");
-      else showToast(res?.error || "Could not restore group", "error");
-    });
-
-    card.querySelector(".delete-btn").addEventListener("click", async (e) => {
-      e.stopPropagation();
-      const name = group.title || "Unnamed Group";
-      const count = group.tabCount || (group.tabs || []).length || 0;
-      const ok = await showModal({
-        title: `Delete "${name}"?`,
-        body: `Removes ${count} tab${count !== 1 ? "s" : ""} from your Inbox. Your browser tabs are unaffected.`,
-        confirmText: "Delete", danger: true,
-      });
-      if (!ok) return;
-      const groupSnapshot = { ...group, tabs: [...(group.tabs || [])] };
-      // Use the closure `card` — e.currentTarget is null after the awaited modal.
-      card.remove();
-      state.savedGroups = state.savedGroups.filter((g) => g.uid !== group.uid);
-      buildIndexes();
-      updateSavedEmptyState();
-      sendMsg({ action: "deleteGroup", groupUid: group.uid });
-      showUndoToast(`"${name}" deleted`, () => {
-        sendMsg({ action: "restoreDeletedGroup", group: groupSnapshot });
-      });
-    });
-
-    // ── Drag-and-drop reordering ──────────────────────────────────────────────
-    card.addEventListener("dragstart", (e) => {
-      e.dataTransfer.effectAllowed = "move";
-      e.dataTransfer.setData("text/plain", group.uid);
-      setTimeout(() => card.classList.add("dragging"), 0);
-    });
-    card.addEventListener("dragend", () => card.classList.remove("dragging"));
-    card.addEventListener("dragover", (e) => {
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "move";
-      card.classList.add("drag-over");
-    });
-    card.addEventListener("dragleave", (e) => {
-      if (!card.contains(e.relatedTarget)) card.classList.remove("drag-over");
-    });
-    card.addEventListener("drop", async (e) => {
-      e.preventDefault();
-      card.classList.remove("drag-over");
-      const dragUid = e.dataTransfer.getData("text/plain");
-      if (!dragUid || dragUid === group.uid) return;
-
-      const dragIdx = state.savedGroups.findIndex(g => g.uid === dragUid);
-      const dropIdx = state.savedGroups.findIndex(g => g.uid === group.uid);
-      if (dragIdx === -1 || dropIdx === -1) return;
-
-      const [moved] = state.savedGroups.splice(dragIdx, 1);
-      const newDrop  = state.savedGroups.findIndex(g => g.uid === group.uid);
-      state.savedGroups.splice(newDrop, 0, moved);
-      buildIndexes();
-      renderSavedPane();
-      sendMsg({ action: "reorderGroups", orderedUids: state.savedGroups.map(g => g.uid) });
-    });
-
-    bindTabCountExpand(card, group);
-    frag.appendChild(card);
-  });
+    const section = document.createElement("div");
+    section.className = "saved-folder-section";
+    const header = document.createElement("div");
+    header.className = "saved-folder-header";
+    header.innerHTML = `<span class="saved-folder-name">📁 ${escHtml(f.name || "Folder")}</span>
+      <span class="saved-folder-count">${members.length}</span>`;
+    section.appendChild(header);
+    members.forEach((group, index) => section.appendChild(createSavedCard(group, index)));
+    frag.appendChild(section);
+  }
 
   container.innerHTML = "";
   container.appendChild(frag);
