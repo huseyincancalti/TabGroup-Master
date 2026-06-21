@@ -772,7 +772,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // When a free-mode window is closed, mark its group inactive immediately.
 chrome.windows.onRemoved.addListener(async (windowId) => {
-  // Grab the last-known tab list before discarding the tracking entry.
+  // If the SW was restarted from idle, _awRestore may still be in progress.
+  // Wait for it so _activeWindows is populated before we read it.
+  await _swReady;
+
   const tracked = _activeWindows.get(windowId);
   _activeWindows.delete(windowId);
   _awPersist();
@@ -781,21 +784,20 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
   let changed = false;
   for (const g of store.savedGroups) {
     if (g.openWindowId !== windowId) continue;
-    // Write the final tab state back so manual changes (closed tabs,
-    // navigations) survive the next time the group is opened.
     if (tracked?.tabs.length) {
+      // Normal path: in-memory tracking was intact.
       g.tabs = tracked.tabs.map(({ url, title }) => ({ url, title }));
       g.tabCount = g.tabs.length;
       g.tabsLoaded = true;
     }
+    // If tracked is empty (SW was idle and session restore had no entry):
+    // g.tabs was already written on every individual tab-close (Fix 3 below),
+    // so we keep the existing storage value — just flip the active flags.
     g.active = false;
     g.openWindowId = null;
     changed = true;
   }
-  if (changed) {
-    await setStore({ savedGroups: store.savedGroups });
-    // storage.onChanged notifies all pages — no explicit sendMessage needed.
-  }
+  if (changed) await setStore({ savedGroups: store.savedGroups });
 });
 
 chrome.tabGroups.onCreated.addListener(scheduleReconcile);
@@ -803,8 +805,11 @@ chrome.tabGroups.onUpdated.addListener(scheduleReconcile);
 chrome.tabGroups.onRemoved.addListener(scheduleReconcile);
 chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
   if (!removeInfo.isWindowClosing) {
-    // Individual tab close — remove from tracking map and update stored tabCount
-    // immediately so the sidepanel reflects the real count in real-time.
+    // Individual tab close while the window stays open.
+    // Write the FULL updated tab list to storage immediately — do not just
+    // update tabCount. This ensures the correct list survives even if the
+    // SW goes idle before the window is closed (Fix for "deleted tabs reappear").
+    await _swReady;
     for (const data of _activeWindows.values()) {
       const idx = data.tabs.findIndex(t => t.id === tabId);
       if (idx >= 0) {
@@ -812,7 +817,12 @@ chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
         _awPersist();
         const store = await getStore();
         const g = store.savedGroups.find(sg => sg.uid === data.groupUid);
-        if (g) { g.tabCount = data.tabs.length; await setStore({ savedGroups: store.savedGroups }); }
+        if (g) {
+          g.tabs = data.tabs.map(({ url, title }) => ({ url, title }));
+          g.tabCount = g.tabs.length;
+          g.tabsLoaded = true;
+          await setStore({ savedGroups: store.savedGroups });
+        }
         break;
       }
     }
@@ -828,33 +838,49 @@ chrome.tabs.onCreated.addListener(async (tab) => {
     _awPersist();
     const store = await getStore();
     const g = store.savedGroups.find(sg => sg.uid === data.groupUid);
-    if (g) { g.tabCount = data.tabs.length; await setStore({ savedGroups: store.savedGroups }); }
+    if (g) {
+      g.tabs = data.tabs.map(({ url, title }) => ({ url, title }));
+      g.tabCount = g.tabs.length;
+      g.tabsLoaded = true;
+      await setStore({ savedGroups: store.savedGroups });
+    }
   }
   scheduleReconcile();
 });
 
-chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   // Keep tracking map current when a tab navigates or its title changes.
   if (info.url || info.title) {
-    let changed = false;
+    let changedData = null;
     for (const data of _activeWindows.values()) {
       const tracked = data.tabs.find(t => t.id === tabId);
       if (tracked) {
         if (info.url) tracked.url = _realUrl(info.url);
         if (info.title) tracked.title = info.title;
-        changed = true;
+        changedData = data;
+        break;
       } else if (info.url && !info.url.startsWith("chrome://") && !_isSuspended(info.url)
                  && _activeWindows.has(tab.windowId)) {
-        // Tab started as chrome://newtab and navigated to a real page — add it now.
-        _activeWindows.get(tab.windowId).tabs.push({
-          id: tabId,
-          url: _realUrl(info.url),
-          title: info.title || tab.title || "",
-        });
-        changed = true;
+        const d = _activeWindows.get(tab.windowId);
+        d.tabs.push({ id: tabId, url: _realUrl(info.url), title: info.title || tab.title || "" });
+        changedData = d;
+        break;
       }
     }
-    if (changed) _awPersist();
+    if (changedData) {
+      _awPersist();
+      // Write the full tab list immediately so navigation changes survive SW idle.
+      try {
+        const store = await getStore();
+        const g = store.savedGroups.find(sg => sg.uid === changedData.groupUid);
+        if (g) {
+          g.tabs = changedData.tabs.map(({ url, title }) => ({ url, title }));
+          g.tabCount = g.tabs.length;
+          g.tabsLoaded = true;
+          await setStore({ savedGroups: store.savedGroups });
+        }
+      } catch (_) {}
+    }
   }
   if (info.groupId !== undefined || info.title || info.url) scheduleReconcile();
 });
@@ -1442,7 +1468,10 @@ const handlers = {
 // pulled another profile/account's data in and overwrote this profile's groups.
 // Recovery is now strictly opt-in: pages call getRecoveryStatus and OFFER it;
 // applyRecovery runs only on an explicit click and merges (never overwrites).
-_awRestore().then(() => reconcile());
+// _swReady resolves once _awRestore + initial reconcile have finished.
+// Every event handler that reads _activeWindows awaits this so it never
+// races against the async restore when the SW was restarted from idle.
+const _swReady = _awRestore().then(() => reconcile());
 
 // Keyboard shortcut: Ctrl+Shift+G → save focused window as group
 chrome.commands.onCommand.addListener(async (command) => {
