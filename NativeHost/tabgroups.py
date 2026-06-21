@@ -24,26 +24,44 @@ def _app_data_dir():
 
 # ── App-data file backup (outside the browser profile, survives resets) ────────
 _BACKUP_DIR  = _app_data_dir()
-_BACKUP_FILE = os.path.join(_BACKUP_DIR, "workspace_backup.json")
+_BACKUP_FILE = os.path.join(_BACKUP_DIR, "workspace_backup.json")  # legacy/shared
 
 
-def save_backup(data: dict) -> bool:
+def _backup_path(key=None) -> str:
+    """Per-profile backup path. Each browser profile passes its own random key so
+    profiles never share one file (which used to let one account's data overwrite
+    or restore another's). No key -> the legacy shared file (backward compatible)."""
+    if key:
+        safe = "".join(c for c in str(key) if c.isalnum() or c in "-_")
+        if safe:
+            return os.path.join(_BACKUP_DIR, "workspace_backup_%s.json" % safe)
+    return _BACKUP_FILE
+
+
+def save_backup(data: dict, key=None) -> bool:
     """Persist the full workspace to LOCALAPPDATA. Survives Chrome profile wipes."""
     try:
         os.makedirs(_BACKUP_DIR, exist_ok=True)
-        tmp = _BACKUP_FILE + ".tmp"
+        path = _backup_path(key)
+        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-        os.replace(tmp, _BACKUP_FILE)   # atomic write
+        os.replace(tmp, path)   # atomic write
         return True
     except Exception:
         return False
 
 
-def load_backup() -> dict | None:
-    """Read workspace backup from LOCALAPPDATA. Returns None if not found."""
+def load_backup(key=None) -> dict | None:
+    """Read this profile's backup from LOCALAPPDATA. Returns None if not found.
+
+    When a per-profile key is given we read ONLY that profile's file and never
+    the legacy shared workspace_backup.json — that shared file may hold other
+    profiles'/accounts' groups, and surfacing it is exactly the cross-account
+    bleed we're eliminating. Old clients that send no key still read the legacy
+    file (backward compatible)."""
     try:
-        with open(_BACKUP_FILE, "r", encoding="utf-8") as f:
+        with open(_backup_path(key), "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
@@ -249,10 +267,17 @@ def extract(profile_dirs=None):
                 title = group.get(2)
                 color_id = group.get(3, 0)
                 if isinstance(guid, str):
-                    groups[guid] = {
-                        "title": title if isinstance(title, str) else "",
-                        "color": COLOR_NAMES.get(color_id if isinstance(color_id, int) else 0, "grey"),
-                    }
+                    new_title = title if isinstance(title, str) else ""
+                    existing = groups.get(guid)
+                    # Chrome keeps several revisions of a group in the sync DB.
+                    # Keep the named revision: never let a later empty-title
+                    # revision blank out a group that already has a name. This is
+                    # why some groups were showing up as "nameless" duplicates.
+                    if existing is None or (not existing["title"] and new_title):
+                        groups[guid] = {
+                            "title": new_title,
+                            "color": COLOR_NAMES.get(color_id if isinstance(color_id, int) else 0, "grey"),
+                        }
             elif isinstance(tab, dict):
                 url = tab.get(3)
                 title = tab.get(4)
@@ -271,6 +296,10 @@ def extract(profile_dirs=None):
     saved_groups = []
     for guid, info in groups.items():
         group_tabs = sorted(by_group.get(guid, []), key=lambda t: t["position"])
+        # Skip tombstones / deleted groups: a real saved group always has tabs.
+        # These tab-less entities are what showed up as random "nameless" junk.
+        if not group_tabs:
+            continue
         saved_groups.append({
             "title": info["title"],
             "color": info["color"],

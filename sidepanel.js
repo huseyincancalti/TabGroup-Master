@@ -15,12 +15,15 @@ const state = {
   editingGroupUid: null,
   activeTab: "active",
   groupIndex: new Map(),
+  selectionMode: false,
+  selectedUids: new Set(),
 };
 
 document.addEventListener("DOMContentLoaded", async () => {
   await loadData();
   bindStaticListeners();
   render();
+  checkRecoveryOffer();
 });
 
 // Storage-event driven updates: reliable regardless of how many extension
@@ -37,12 +40,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // Non-async so the message channel closes immediately — no stuck channels.
 chrome.runtime.onMessage.addListener((message) => {
   if (!message) return;
-  if (message.type === "RESTORED_FROM_CLOUD") {
-    loadData().then(() => {
-      render();
-      showToast(`♻️ Restored ${message.groupCount} groups from sync backup — open each group once to re-store tab URLs`, "info");
-    }).catch(() => {});
-  } else if (message.type === "RESTORED_FROM_BACKUP") {
+  if (message.type === "RESTORED_FROM_BACKUP") {
     loadData().then(() => {
       render();
       showToast(`✅ Data restored! ${message.groupCount} groups + ${message.folderCount} folders recovered from local backup.`, "success");
@@ -69,14 +67,19 @@ function sendMsg(message) {
 }
 
 async function loadData() {
-  let store = await sendMsg({ action: "getStore" });
-  if (!store) {
-    // SW unresponsive — read directly from chrome.storage.local
-    try {
-      const raw = await chrome.storage.local.get(["savedGroups", "folders"]);
-      store = { savedGroups: raw.savedGroups || [], folders: raw.folders || [] };
-    } catch (_) { return; }
-  }
+  // Read straight from chrome.storage.local — this is the source of truth and
+  // is instant, so the panel paints immediately even when the MV3 service
+  // worker is cold (no round-trip wait → no "save feels slow" lag). The SW is
+  // only needed for MUTATIONS; storage.onChanged keeps this in sync after them.
+  try {
+    const raw = await chrome.storage.local.get(["savedGroups", "folders"]);
+    state.savedGroups = raw.savedGroups || [];
+    state.folders = raw.folders || [];
+    buildIndexes();
+    return;
+  } catch (_) {}
+  // Last resort if direct storage access ever fails: ask the service worker.
+  const store = await sendMsg({ action: "getStore" });
   if (!store) return;
   state.savedGroups = store.savedGroups || [];
   state.folders = store.folders || [];
@@ -242,6 +245,7 @@ function switchTab(tabName) {
   });
   document.querySelectorAll(".pane").forEach((pane) => pane.classList.add("hidden"));
   document.getElementById(`pane-${tabName}`)?.classList.remove("hidden");
+  if (state.selectionMode) updateSelectionBar();
 }
 
 function render() {
@@ -262,7 +266,9 @@ function renderActivePane() {
   const frag = document.createDocumentFragment();
   active.forEach((group, index) => {
     const card = document.createElement("div");
-    card.className = "group-card animate-in";
+    card.className = "group-card animate-in"
+      + (state.selectionMode ? " selecting" : "")
+      + (state.selectedUids.has(group.uid) ? " selected" : "");
     card.style.animationDelay = `${index * 40}ms`;
     card.innerHTML = buildGroupCardHTML(group);
     bindActiveCardActions(card, group);
@@ -280,11 +286,16 @@ function buildGroupCardHTML(group) {
   const trackingBadge = group.openWindowId
     ? `<div class="group-tracking-badge"><span class="tracking-dot"></span>tracking changes</div>`
     : "";
+  const unst = group.tabsUnstored ? ` <span class="unstored-badge">· sync only</span>` : "";
+  const sel = state.selectionMode
+    ? `<input type="checkbox" class="card-select-check" ${state.selectedUids.has(group.uid) ? "checked" : ""} aria-label="Select group" />`
+    : "";
   return `
+    ${sel}
     <span class="group-color-dot" style="background:${dot}"></span>
     <div class="group-info">
       <div class="group-title">${title} ${inFolder}</div>
-      <div class="group-tab-count">${tabCount} tab${tabCount !== 1 ? "s" : ""}</div>
+      <div class="group-tab-count">${tabCount} tab${tabCount !== 1 ? "s" : ""}${unst}</div>
       ${trackingBadge}
     </div>
     <div class="group-actions">
@@ -312,6 +323,7 @@ function buildGroupCardHTML(group) {
 }
 
 function bindActiveCardActions(card, group) {
+  if (state.selectionMode) { bindSelectable(card, group); return; }
   bindTabCountExpand(card, group);
 
   // Clicking the card body brings the group's open window to the front.
@@ -335,7 +347,8 @@ function bindActiveCardActions(card, group) {
     });
     if (!ok) return;
     const groupSnapshot = { ...group, tabs: [...(group.tabs || [])] };
-    (e.currentTarget.closest(".group-card") || card).remove();
+    // Use the closure `card` — e.currentTarget is null after the awaited modal.
+    card.remove();
     state.savedGroups = state.savedGroups.filter((g) => g.uid !== group.uid);
     buildIndexes();
     document.getElementById("empty-active")?.classList.toggle("hidden", state.savedGroups.some((g) => g.active));
@@ -377,16 +390,23 @@ function renderSavedPane() {
     const tabCount = getGroupTabCount(group);
 
     const card = document.createElement("div");
-    card.className = "group-card saved-group-card animate-in";
+    card.className = "group-card saved-group-card animate-in"
+      + (state.selectionMode ? " selecting" : "")
+      + (state.selectedUids.has(group.uid) ? " selected" : "");
     card.dataset.groupUid = group.uid;
-    card.draggable = true;
+    card.draggable = !state.selectionMode;
     card.style.animationDelay = `${index * 40}ms`;
+    const unst = group.tabsUnstored ? ` <span class="unstored-badge">· sync only</span>` : "";
+    const sel = state.selectionMode
+      ? `<input type="checkbox" class="card-select-check" ${state.selectedUids.has(group.uid) ? "checked" : ""} aria-label="Select group" />`
+      : "";
     card.innerHTML = `
+      ${sel}
       <span class="drag-handle" title="Drag to reorder">⠿</span>
       <span class="group-color-dot" style="background:${dot}"></span>
       <div class="group-info">
         <div class="group-title">${title}</div>
-        <div class="group-tab-count">${tabCount} tab${tabCount !== 1 ? "s" : ""}${group.savedAt ? ` <span class="group-saved-at">· ${timeAgo(group.savedAt)}</span>` : ""}</div>
+        <div class="group-tab-count">${tabCount} tab${tabCount !== 1 ? "s" : ""}${unst}${group.savedAt ? ` <span class="group-saved-at">· ${timeAgo(group.savedAt)}</span>` : ""}</div>
       </div>
       <div class="group-actions">
         <button class="edit-group-btn" type="button" title="Edit group">
@@ -411,6 +431,12 @@ function renderSavedPane() {
         </button>
       </div>`;
 
+    if (state.selectionMode) {
+      bindSelectable(card, group);
+      frag.appendChild(card);
+      return;
+    }
+
     card.querySelector(".edit-group-btn").addEventListener("click", (e) => {
       e.stopPropagation();
       openEditModal(group);
@@ -433,7 +459,8 @@ function renderSavedPane() {
       });
       if (!ok) return;
       const groupSnapshot = { ...group, tabs: [...(group.tabs || [])] };
-      (e.currentTarget.closest(".saved-group-card") || card).remove();
+      // Use the closure `card` — e.currentTarget is null after the awaited modal.
+      card.remove();
       state.savedGroups = state.savedGroups.filter((g) => g.uid !== group.uid);
       buildIndexes();
       updateSavedEmptyState();
@@ -624,28 +651,32 @@ function hideImportOverlay() {
 }
 
 function setImportStep(step) {
-  // step: "loading" | "picker" | "importing"
+  // step: "loading" | "picker" | "groups" | "importing"
   const pickerEl    = document.getElementById("step-picker");
+  const groupsEl    = document.getElementById("step-groups");
   const importingEl = document.getElementById("step-importing");
   const loadingEl   = document.getElementById("profile-list-loading");
   const listEl      = document.getElementById("profile-list");
   const actionsEl   = document.getElementById("profile-actions");
   if (!pickerEl || !importingEl) return;
 
+  pickerEl.classList.add("hidden");
+  groupsEl?.classList.add("hidden");
+  importingEl.classList.add("hidden");
+
   if (step === "loading") {
     pickerEl.classList.remove("hidden");
-    importingEl.classList.add("hidden");
     loadingEl?.classList.remove("hidden");
     listEl?.classList.add("hidden");
     actionsEl?.classList.add("hidden");
   } else if (step === "picker") {
     pickerEl.classList.remove("hidden");
-    importingEl.classList.add("hidden");
     loadingEl?.classList.add("hidden");
     listEl?.classList.remove("hidden");
     actionsEl?.classList.remove("hidden");
+  } else if (step === "groups") {
+    groupsEl?.classList.remove("hidden");
   } else if (step === "importing") {
-    pickerEl.classList.add("hidden");
     importingEl.classList.remove("hidden");
   }
 }
@@ -702,20 +733,99 @@ async function runImport() {
   }
 }
 
-// btn-picker-confirm: import only from the selected profiles
+// btn-picker-confirm: read groups from the selected profile(s), then let the
+// user choose WHICH groups to import. Nothing is saved until they confirm.
+let _extractedGroups = [];
+let _extractedFolders = [];
+
 async function doImport(profileDirs) {
   // Security: never import from all profiles. Require an explicit selection.
   if (!Array.isArray(profileDirs) || !profileDirs.length) {
     showToast("⚠️ Select a profile first — only the account you pick is imported.", "info");
     return;
   }
+  setImportStep("importing"); // spinner while the database is read
+  try {
+    const res = await sendMsg({ action: "extractChromeGroups", profileDirs });
+    if (!res?.ok) {
+      showToast("❌ " + (res?.error || "Could not read groups"), "error");
+      _importing = false;
+      hideImportOverlay();
+      return;
+    }
+    _extractedGroups = res.savedGroups || [];
+    _extractedFolders = res.folders || [];
+    if (!_extractedGroups.length) {
+      showToast("No saved tab groups found in that profile.", "info");
+      _importing = false;
+      hideImportOverlay();
+      return;
+    }
+    populateGroupPickList(_extractedGroups);
+    setImportStep("groups");
+    // _importing stays true until the user confirms or cancels the group picker
+  } catch (e) {
+    showToast("❌ " + (e?.message || "Import failed"), "error");
+    _importing = false;
+    hideImportOverlay();
+  }
+}
+
+function populateGroupPickList(groups) {
+  const list = document.getElementById("grouppick-list");
+  if (!list) return;
+  list.innerHTML = "";
+  groups.forEach((g, i) => {
+    const n = typeof g.tabCount === "number" ? g.tabCount : (g.tabs || []).length;
+    const label = document.createElement("label");
+    label.className = "profile-item group-pick-item";
+    label.innerHTML = `
+      <input type="checkbox" class="grouppick-check" data-i="${i}" checked />
+      <div class="profile-info">
+        <span class="profile-display-name">${escHtml(g.title || "Unnamed Group")}</span>
+        <span class="group-pick-meta">${n} tab${n !== 1 ? "s" : ""}</span>
+      </div>`;
+    list.appendChild(label);
+  });
+  list.querySelectorAll(".grouppick-check").forEach((cb) =>
+    cb.addEventListener("change", updateGroupPickCount)
+  );
+  updateGroupPickCount();
+}
+
+function updateGroupPickCount() {
+  const checks = [...document.querySelectorAll(".grouppick-check")];
+  const sel = checks.filter((c) => c.checked).length;
+  const countEl = document.getElementById("grouppick-count");
+  if (countEl) countEl.textContent = `${sel} selected`;
+  const allBtn = document.getElementById("grouppick-all");
+  if (allBtn) allBtn.textContent = (checks.length && sel === checks.length) ? "Select none" : "Select all";
+  const confirmBtn = document.getElementById("btn-grouppick-confirm");
+  if (confirmBtn) confirmBtn.disabled = sel === 0;
+}
+
+function toggleGroupPickAll() {
+  const checks = [...document.querySelectorAll(".grouppick-check")];
+  const allSel = checks.length && checks.every((c) => c.checked);
+  checks.forEach((c) => { c.checked = !allSel; });
+  updateGroupPickCount();
+}
+
+async function confirmGroupImport() {
+  const chosen = [...document.querySelectorAll(".grouppick-check:checked")]
+    .map((c) => _extractedGroups[parseInt(c.dataset.i, 10)])
+    .filter(Boolean);
+  if (!chosen.length) { showToast("Tick at least one group to import.", "info"); return; }
   setImportStep("importing");
   try {
-    const res = await sendMsg({ action: "importFromChrome", profileDirs });
+    const res = await sendMsg({ action: "importJson", data: { savedGroups: chosen, folders: _extractedFolders } });
     if (res?.ok) {
       await loadData();
       render();
-      showToast(`✅ Imported ${res.added} new group${res.added !== 1 ? "s" : ""}${res.total ? ` (${res.total} found)` : ""}`, "success");
+      const msg = res.added > 0
+        ? `✅ Imported ${res.added} group${res.added !== 1 ? "s" : ""}`
+        : "No new groups — those were already imported";
+      showToast(msg, res.added > 0 ? "success" : "info");
     } else {
       showToast("❌ " + (res?.error || "Import failed"), "error");
     }
@@ -723,6 +833,8 @@ async function doImport(profileDirs) {
     showToast("❌ " + (e?.message || "Import failed"), "error");
   } finally {
     _importing = false;
+    _extractedGroups = [];
+    _extractedFolders = [];
     hideImportOverlay();
   }
 }
@@ -768,30 +880,127 @@ async function refreshWorkspace() {
   showToast("Workspace refreshed", "success");
 }
 
-function openResetWorkspaceModal() {
-  document.getElementById("sp-reset-overlay")?.classList.remove("hidden");
+// "Reset Everything" intentionally lives only in Dashboard → Settings → Danger
+// Zone, not in this daily-use panel. Individual groups are removed with each
+// card's own delete button (with Undo). This keeps a destructive bulk action
+// from sitting one stray click away in the header.
+
+// ── Multi-select / bulk delete ──────────────────────────────────────────────
+// Replaces the old header "nuke everything" with something practical: tick the
+// groups you don't want (Inbox or Active) and delete them in one go, with Undo.
+function setSelectionMode(on) {
+  state.selectionMode = on;
+  state.selectedUids.clear();
+  document.getElementById("btn-select-mode")?.classList.toggle("active", on);
+  document.getElementById("selection-bar")?.classList.toggle("hidden", !on);
+  render();
+  updateSelectionBar();
 }
 
-function closeResetWorkspaceModal() {
-  document.getElementById("sp-reset-overlay")?.classList.add("hidden");
+function bindSelectable(card, group) {
+  const check = card.querySelector(".card-select-check");
+  const apply = (on) => {
+    if (on) state.selectedUids.add(group.uid);
+    else state.selectedUids.delete(group.uid);
+    card.classList.toggle("selected", on);
+    if (check) check.checked = on;
+    updateSelectionBar();
+  };
+  card.addEventListener("click", (e) => {
+    if (e.target === check) return; // the checkbox toggles itself
+    apply(!state.selectedUids.has(group.uid));
+  });
+  check?.addEventListener("change", () => apply(check.checked));
 }
 
-async function confirmResetWorkspace() {
-  const g = state.savedGroups.length;
-  const f = state.folders.length;
+function currentPaneGroups() {
+  return state.activeTab === "active"
+    ? state.savedGroups.filter((g) => g.active).filter((g) => groupMatchesSearch(g, state.searchQuery))
+    : getInboxGroups();
+}
+
+function updateSelectionBar() {
+  const n = state.selectedUids.size;
+  const countEl = document.getElementById("sel-count");
+  if (countEl) countEl.textContent = `${n} selected`;
+  const delBtn = document.getElementById("sel-delete");
+  if (delBtn) delBtn.disabled = n === 0;
+  const allBtn = document.getElementById("sel-all");
+  if (allBtn) {
+    const groups = currentPaneGroups();
+    const allSel = groups.length > 0 && groups.every((g) => state.selectedUids.has(g.uid));
+    allBtn.textContent = allSel ? "Clear all" : "Select all";
+  }
+}
+
+function toggleSelectAll() {
+  const groups = currentPaneGroups();
+  const allSel = groups.length > 0 && groups.every((g) => state.selectedUids.has(g.uid));
+  groups.forEach((g) => {
+    if (allSel) state.selectedUids.delete(g.uid);
+    else state.selectedUids.add(g.uid);
+  });
+  render();
+  updateSelectionBar();
+}
+
+async function deleteSelected() {
+  const uids = [...state.selectedUids];
+  if (!uids.length) return;
   const ok = await showModal({
-    title: "Nuke everything?",
-    body: `This permanently deletes all ${g} group${g !== 1 ? "s" : ""} and ${f} folder${f !== 1 ? "s" : ""}. Export a JSON backup first if you want to recover later.`,
-    confirmText: "Yes, nuke it", cancelText: "Cancel", danger: true, icon: "💥",
+    title: `Delete ${uids.length} group${uids.length !== 1 ? "s" : ""}?`,
+    body: "The selected groups are removed from your workspace. Your open browser tabs are untouched. You can Undo.",
+    confirmText: `Delete ${uids.length}`, cancelText: "Cancel", danger: true,
   });
   if (!ok) return;
-  closeResetWorkspaceModal();
-  await chrome.storage.local.remove(["savedGroups", "folders"]);
-  state.savedGroups = [];
-  state.folders = [];
+  const snapshots = uids
+    .map((u) => state.groupIndex.get(u))
+    .filter(Boolean)
+    .map((g) => ({ ...g, tabs: [...(g.tabs || [])] }));
+  const selected = new Set(uids);
+  state.savedGroups = state.savedGroups.filter((g) => !selected.has(g.uid));
   buildIndexes();
-  render();
-  showToast("Workspace reset", "success");
+  sendMsg({ action: "deleteMultipleGroups", groupUids: uids });
+  setSelectionMode(false);
+  showUndoToast(`Deleted ${uids.length} group${uids.length !== 1 ? "s" : ""}`, () => {
+    sendMsg({ action: "restoreDeletedGroups", groups: snapshots });
+  });
+}
+
+// Offer (never force) a one-click recovery if a backup holds groups not in this
+// profile. Restoring MERGES — it never overwrites or deletes existing groups.
+async function checkRecoveryOffer() {
+  if (document.getElementById("cloud-restore-banner")) return;
+  if (sessionStorage.getItem("recoveryOfferDismissed")) return;
+  const res = await sendMsg({ action: "getRecoveryStatus" });
+  if (!res?.available) return;
+  const banner = document.createElement("div");
+  banner.id = "cloud-restore-banner";
+  const count = res.groupCount || 0;
+  const where = res.source === "file" ? "local backup" : "cloud backup";
+  const tabsNote = res.hasTabs ? "" : " (titles only)";
+  banner.innerHTML = `
+    <span class="cloud-banner-text">💾 ${count} group${count !== 1 ? "s" : ""} in your ${where}${tabsNote} — restore?</span>
+    <button class="cloud-banner-restore" type="button">Restore</button>
+    <button class="cloud-banner-dismiss" type="button" title="Dismiss">✕</button>`;
+  banner.querySelector(".cloud-banner-restore").addEventListener("click", async () => {
+    banner.remove();
+    const applyRes = await sendMsg({ action: "applyRecovery", source: res.source });
+    if (applyRes?.ok) {
+      await loadData();
+      render();
+      const n = applyRes.restored || 0;
+      const tail = res.hasTabs ? "" : " — open each once to reload URLs";
+      showToast(`Recovered ${n} group${n !== 1 ? "s" : ""}${tail}`, "info");
+    } else {
+      showToast("Recovery failed", "error");
+    }
+  });
+  banner.querySelector(".cloud-banner-dismiss").addEventListener("click", () => {
+    sessionStorage.setItem("recoveryOfferDismissed", "1");
+    banner.remove();
+  });
+  document.getElementById("toolbar")?.insertAdjacentElement("afterend", banner);
 }
 
 function bindStaticListeners() {
@@ -841,13 +1050,23 @@ function bindStaticListeners() {
     await doImport(dirs);
   });
 
-  document.getElementById("btn-refresh-workspace")?.addEventListener("click", refreshWorkspace);
-  document.getElementById("btn-reset-workspace")?.addEventListener("click", openResetWorkspaceModal);
-  document.getElementById("sp-reset-cancel")?.addEventListener("click", closeResetWorkspaceModal);
-  document.getElementById("sp-reset-confirm")?.addEventListener("click", confirmResetWorkspace);
-  document.getElementById("sp-reset-overlay")?.addEventListener("click", (e) => {
-    if (e.target === e.currentTarget) closeResetWorkspaceModal();
+  document.getElementById("grouppick-all")?.addEventListener("click", toggleGroupPickAll);
+  document.getElementById("btn-grouppick-confirm")?.addEventListener("click", confirmGroupImport);
+  document.getElementById("btn-grouppick-cancel")?.addEventListener("click", () => {
+    _importing = false;
+    _extractedGroups = [];
+    _extractedFolders = [];
+    hideImportOverlay();
   });
+
+  document.getElementById("btn-refresh-workspace")?.addEventListener("click", refreshWorkspace);
+
+  document.getElementById("btn-select-mode")?.addEventListener("click", () => {
+    setSelectionMode(!state.selectionMode);
+  });
+  document.getElementById("sel-all")?.addEventListener("click", toggleSelectAll);
+  document.getElementById("sel-delete")?.addEventListener("click", deleteSelected);
+  document.getElementById("sel-cancel")?.addEventListener("click", () => setSelectionMode(false));
 
   document.querySelectorAll(".tab-btn").forEach((btn) => {
     btn.addEventListener("click", () => switchTab(btn.dataset.tab));
@@ -874,15 +1093,18 @@ function bindStaticListeners() {
 
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
-    if (!document.getElementById("sp-reset-overlay")?.classList.contains("hidden")) {
-      closeResetWorkspaceModal();
-    }
-    // Cancel import only on the picker step (not while actually importing)
+    // Cancel import on the profile-picker or group-picker step (never while the
+    // database is actively being read/imported, to avoid leaving it half-done).
     const overlay = document.getElementById("import-overlay");
     const pickerStep = document.getElementById("step-picker");
-    if (overlay && !overlay.classList.contains("hidden") &&
-        pickerStep && !pickerStep.classList.contains("hidden")) {
+    const groupsStep = document.getElementById("step-groups");
+    const onCancellableStep =
+      (pickerStep && !pickerStep.classList.contains("hidden")) ||
+      (groupsStep && !groupsStep.classList.contains("hidden"));
+    if (overlay && !overlay.classList.contains("hidden") && onCancellableStep) {
       _importing = false;
+      _extractedGroups = [];
+      _extractedFolders = [];
       hideImportOverlay();
     }
   });

@@ -44,6 +44,10 @@ function normalizeGroup(group) {
     openWindowId: group.openWindowId ?? null,
     folderId: group.folderId ?? null,
     savedAt: group.savedAt || Date.now(),
+    // Cloud-restored groups have a tab count but no stored URLs — flagged so
+    // the UI can label them instead of showing a misleading count. Cleared the
+    // moment real tabs are stored (see clearing logic where tabs are written).
+    tabsUnstored: group.tabsUnstored === true,
   };
 }
 
@@ -62,6 +66,44 @@ async function getStore() {
     savedGroups: (data.savedGroups || []).map(normalizeGroup),
     folders: (data.folders || []).map(normalizeFolder),
   };
+}
+
+// ── Deleted-group memory (tombstones) ───────────────────────────────────────
+// Remembers groups the user has deleted so re-importing from Chrome doesn't keep
+// resurrecting them — Chrome still has them in its synced DB. A tombstone is
+// cleared per-group on Undo, or wholesale via "Clear import history" in Settings.
+const DELETED_KEYS = "deletedGroupKeys";
+const MAX_DELETED_KEYS = 800;
+
+// Identity that survives re-import: normalized title + the set of tab hostnames.
+function groupSignature(g) {
+  const title = normalizeTitle(g?.title || "");
+  const hosts = [...new Set((g?.tabs || []).map((t) => {
+    try { return new URL(t.url).hostname.replace(/^www\./, ""); } catch (_) { return ""; }
+  }).filter(Boolean))].sort().join(",");
+  return title + "::" + hosts;
+}
+
+async function getDeletedKeys() {
+  const d = await chrome.storage.local.get(DELETED_KEYS);
+  return new Set(Array.isArray(d[DELETED_KEYS]) ? d[DELETED_KEYS] : []);
+}
+
+async function addDeletedKeys(groups) {
+  const set = await getDeletedKeys();
+  for (const g of groups) {
+    const sig = groupSignature(g);
+    if (sig && sig !== "::") set.add(sig);
+  }
+  let arr = [...set];
+  if (arr.length > MAX_DELETED_KEYS) arr = arr.slice(arr.length - MAX_DELETED_KEYS);
+  await chrome.storage.local.set({ [DELETED_KEYS]: arr });
+}
+
+async function removeDeletedKeys(groups) {
+  const set = await getDeletedKeys();
+  for (const g of groups) set.delete(groupSignature(g));
+  await chrome.storage.local.set({ [DELETED_KEYS]: [...set] });
 }
 
 // ── User settings ──────────────────────────────────────────────────────────────
@@ -156,6 +198,28 @@ async function _awRestore() {
 
 let _fileBackupTimer = null;
 
+// Per-profile backup key. chrome.storage.local is NOT synced and is unique to
+// this browser profile, so a key kept here isolates THIS profile's file backup
+// from every other profile/account on the same machine. Without it, all
+// profiles shared a single workspace_backup.json and could overwrite or restore
+// each other's data — the root cause of "groups from another account appeared
+// and my own groups vanished".
+const _BK_KEY = "_backupKey";
+let _backupKeyCache = null;
+async function getBackupKey() {
+  if (_backupKeyCache) return _backupKeyCache;
+  const d = await chrome.storage.local.get(_BK_KEY);
+  let key = d[_BK_KEY];
+  if (!key) {
+    key = (self.crypto?.randomUUID)
+      ? self.crypto.randomUUID()
+      : Date.now().toString(36) + Math.random().toString(36).slice(2);
+    await chrome.storage.local.set({ [_BK_KEY]: key });
+  }
+  _backupKeyCache = key;
+  return key;
+}
+
 function scheduleFileBackup() {
   clearTimeout(_fileBackupTimer);
   _fileBackupTimer = setTimeout(doFileBackup, 30_000); // 30-second debounce
@@ -172,21 +236,20 @@ async function doFileBackup() {
       tabs: (g.tabs || []).map(({ url, title }) => ({ url, title })),
     }));
     const payload = { v: 4, ts: Date.now(), savedGroups, folders: store.folders };
-    await _nativeOneShot("saveBackup", { data: payload }, "saveBackupResult", 10_000);
+    const key = await getBackupKey();
+    await _nativeOneShot("saveBackup", { data: payload, key }, "saveBackupResult", 10_000);
   } catch (_) {}
 }
 
-async function restoreFromFileBackup() {
+// Read THIS profile's file backup (no writes). Returns parsed data or null.
+// Never called automatically — only when the user explicitly asks to recover.
+async function _readFileBackup() {
   try {
-    const local = await chrome.storage.local.get(["savedGroups", "folders"]);
-    if ((local.savedGroups || []).length > 0 || (local.folders || []).length > 0) return;
-    const msg = await _nativeOneShot("loadBackup", {}, "loadBackupResult", 15_000, "loadBackupChunk");
-    if (!msg?.ok || !msg.data?.savedGroups?.length) return;
-    const savedGroups = (msg.data.savedGroups || []).map(normalizeGroup);
-    const folders     = (msg.data.folders     || []).map(normalizeFolder);
-    await chrome.storage.local.set({ savedGroups, folders });
-    broadcast({ type: "RESTORED_FROM_BACKUP", groupCount: savedGroups.length, folderCount: folders.length });
-  } catch (_) {}
+    const key = await getBackupKey();
+    const msg = await _nativeOneShot("loadBackup", { key }, "loadBackupResult", 15_000, "loadBackupChunk");
+    if (!msg?.ok || !msg.data?.savedGroups?.length) return null;
+    return msg.data;
+  } catch (_) { return null; }
 }
 
 // ── Native-host serialization lock ──────────────────────────────────────────
@@ -275,47 +338,84 @@ async function doSyncBackup() {
   } catch (_) { /* quota exceeded or sync disabled — skip silently */ }
 }
 
-async function restoreFromCloud() {
-  try {
-    const meta = (await chrome.storage.sync.get(SYNC_META_KEY))[SYNC_META_KEY];
-    if (!meta?.n) return;
-    const chunkKeys = Array.from({ length: meta.n }, (_, i) => SYNC_CHUNK_KEY + i);
-    const chunks = await chrome.storage.sync.get(chunkKeys);
-    const json = chunkKeys.map(k => chunks[k] || "").join("");
-    if (!json) return;
-    const data = JSON.parse(json);
-    if (!Array.isArray(data?.g) || !data.g.length) return;
+// Read the cloud backup payload (no writes). Returns null if none/invalid.
+async function _readCloudBackup() {
+  const meta = (await chrome.storage.sync.get(SYNC_META_KEY))[SYNC_META_KEY];
+  if (!meta?.n) return null;
+  const chunkKeys = Array.from({ length: meta.n }, (_, i) => SYNC_CHUNK_KEY + i);
+  const chunks = await chrome.storage.sync.get(chunkKeys);
+  const json = chunkKeys.map(k => chunks[k] || "").join("");
+  if (!json) return null;
+  const data = JSON.parse(json);
+  if (!Array.isArray(data?.g) || !data.g.length) return null;
+  return data;
+}
 
+// ── Data recovery (EXPLICIT only — never automatic, never destructive) ───────
+// Offered to the user via a banner; applied ONLY when they click Restore.
+// Prefers this profile's local file backup (full tab URLs) and falls back to
+// the cloud copy (tab counts only). Both paths MERGE new groups into local —
+// they never overwrite or delete what's already there, so an accidental or
+// repeated restore can't lose data.
+async function getRecoveryStatus() {
+  try {
+    const local = await chrome.storage.local.get(["savedGroups"]);
+    const localUids = new Set((local.savedGroups || []).map(g => g.uid));
+
+    const file = await _readFileBackup();
+    if (file?.savedGroups?.length) {
+      const newCount = file.savedGroups.filter(g => !localUids.has(g.uid)).length;
+      if (newCount > 0) return { available: true, source: "file", groupCount: newCount, hasTabs: true };
+    }
+    const cloud = await _readCloudBackup();
+    if (cloud?.g?.length) {
+      const newCount = cloud.g.filter(([u]) => !localUids.has(u)).length;
+      if (newCount > 0) return { available: true, source: "cloud", groupCount: newCount, hasTabs: false };
+    }
+    return { available: false };
+  } catch (_) { return { available: false }; }
+}
+
+async function applyRecovery({ source } = {}) {
+  try {
     const local = await chrome.storage.local.get(["savedGroups", "folders"]);
     const localGroups = local.savedGroups || [];
+    const localFolders = local.folders || [];
+    const localUids = new Set(localGroups.map(g => g.uid));
+    const localFolderIds = new Set(localFolders.map(f => f.id));
 
-    // If local already has data, only merge groups that are missing locally
-    // (preserving existing tab URLs — cloud stores only counts).
-    if (localGroups.length > 0) {
-      const localUids = new Set(localGroups.map(g => g.uid));
-      const cloudOnly = data.g
+    let restored = [];
+    let newFolders = [];
+
+    if (source === "cloud") {
+      const cloud = await _readCloudBackup();
+      if (!cloud) return { ok: false, restored: 0 };
+      restored = cloud.g
         .filter(([u]) => !localUids.has(u))
         .map(([u, t, c, f, n, s]) => normalizeGroup({
-          uid: u, title: t, color: c, folderId: f,
-          tabCount: n, savedAt: s,
+          uid: u, title: t, color: c, folderId: f, tabCount: n, savedAt: s,
           active: false, chromeGroupId: null, tabs: [], tabsLoaded: false,
+          tabsUnstored: n > 0,
         }));
-      if (!cloudOnly.length) return;
-      await chrome.storage.local.set({ savedGroups: [...localGroups, ...cloudOnly] });
-      broadcast({ type: "STORE_UPDATED" });
-      return;
+      newFolders = (cloud.f || []).map(normalizeFolder).filter(f => !localFolderIds.has(f.id));
+    } else {
+      const file = await _readFileBackup();
+      if (!file) return { ok: false, restored: 0 };
+      restored = (file.savedGroups || [])
+        .filter(g => !localUids.has(g.uid))
+        .map(g => normalizeGroup({ ...g, active: false, openWindowId: null, chromeGroupId: null }));
+      newFolders = (file.folders || []).map(normalizeFolder).filter(f => !localFolderIds.has(f.id));
     }
 
-    // Local is empty — full restore from cloud (last resort)
-    const savedGroups = data.g.map(([u, t, c, f, n, s]) => normalizeGroup({
-      uid: u, title: t, color: c, folderId: f,
-      tabCount: n, savedAt: s,
-      active: false, chromeGroupId: null, tabs: [], tabsLoaded: false,
-    }));
-    const folders = (data.f || []).map(normalizeFolder);
-    await chrome.storage.local.set({ savedGroups, folders });
-    broadcast({ type: "RESTORED_FROM_CLOUD", groupCount: savedGroups.length, folderCount: folders.length });
-  } catch (_) { /* restore failed — skip silently */ }
+    if (!restored.length && !newFolders.length) return { ok: true, restored: 0 };
+    // MERGE only — existing local groups are preserved untouched.
+    await chrome.storage.local.set({
+      savedGroups: [...localGroups, ...restored],
+      folders: [...localFolders, ...newFolders],
+    });
+    broadcast({ type: "STORE_UPDATED" });
+    return { ok: true, restored: restored.length, folders: newFolders.length };
+  } catch (_) { return { ok: false, restored: 0 }; }
 }
 
 function buildIndexes(store) {
@@ -382,34 +482,31 @@ async function reconcile() {
   }
 }
 
-function makeCapturedGroup(snapshot, active) {
-  return {
-    uid: uid(),
-    title: snapshot.title,
-    color: snapshot.color,
-    tabs: snapshot.tabs || [],
-    tabCount: snapshot.tabCount,
-    tabsLoaded: Array.isArray(snapshot.tabs),
-    active,
-    chromeGroupId: active ? snapshot.chromeGroupId ?? null : null,
-    folderId: null,
-    savedAt: Date.now(),
-  };
-}
-
+// Reconcile keeps the saved store's ACTIVE/INACTIVE state in sync with what's
+// really open in the browser. It deliberately does NOT capture or import any
+// groups — groups only ever enter the store through an explicit user action
+// (Save This Window, Import from Chrome, New Group, undo a delete).
+//
+// Why no auto-capture: Chrome itself syncs your native tab groups across every
+// device/profile signed into the same Google account. Auto-capturing whatever
+// looked "live" pulled those in too — creating duplicate, tab-less ghost groups
+// on every launch, seemingly "from all my accounts". (User-reported critical
+// bug.) The Active tab now shows only groups TabGroup Master itself opened.
 async function reconcileInner() {
   const store = await getStore();
   const live = await snapshotLiveGroups();
-  const liveIds = new Set(live.map((g) => g.chromeGroupId));
+  const liveById = new Map(live.map((g) => [g.chromeGroupId, g]));
   const liveWindowIds = new Set((await chrome.windows.getAll()).map((w) => w.id));
   const groups = store.savedGroups;
 
   // Snapshot key fields BEFORE mutation so we can skip setStore if nothing changed.
-  const oldSig = groups.map(g => `${g.uid}:${g.active}:${g.chromeGroupId}:${g.openWindowId}`).join("|");
-  const oldLen = groups.length;
+  // tabCount is included so live tab additions/removals get persisted.
+  const sig = (gs) => gs.map(g => `${g.uid}:${g.active}:${g.chromeGroupId}:${g.openWindowId}:${g.tabCount}`).join("|");
+  const oldSig = sig(groups);
 
   for (const g of groups) {
     if (!g.active) continue;
+
     // Free-mode groups live in their own window: active iff that window exists.
     if (g.openWindowId != null) {
       if (!liveWindowIds.has(g.openWindowId)) {
@@ -433,49 +530,30 @@ async function reconcileInner() {
       }
       continue; // never treat window-based groups as Chrome tab groups
     }
-    // Legacy Chrome-tab-group: active iff the group still exists in the strip.
-    if (!liveIds.has(g.chromeGroupId)) {
+
+    // Legacy Chrome-tab-group (only created when freeMode is OFF and the
+    // extension itself restored the group). Active iff it still exists.
+    const liveMatch = liveById.get(g.chromeGroupId);
+    if (!liveMatch) {
       g.active = false;
       g.chromeGroupId = null;
-    }
-  }
-
-  const byChromeId = new Map();
-  const byTitle = new Map();
-  for (const g of groups) {
-    if (g.chromeGroupId != null) byChromeId.set(g.chromeGroupId, g);
-    const key = normalizeTitle(g.title);
-    if (key) {
-      if (!byTitle.has(key)) byTitle.set(key, []);
-      byTitle.get(key).push(g);
-    }
-  }
-
-  const claimed = new Set();
-  for (const lg of live) {
-    let match = byChromeId.get(lg.chromeGroupId);
-    if (!match) {
-      const candidates = byTitle.get(normalizeTitle(lg.title)) || [];
-      match =
-        candidates.find((g) => !claimed.has(g.uid) && !g.active) ||
-        candidates.find((g) => !claimed.has(g.uid));
-    }
-    if (match) {
-      claimed.add(match.uid);
-      match.title = lg.title;
-      match.color = lg.color;
-      match.active = true;
-      match.chromeGroupId = lg.chromeGroupId;
-      match.tabCount = lg.tabCount;
     } else {
-      groups.push(makeCapturedGroup({ ...lg, tabs: undefined }, true));
+      // Keep the saved copy current WHILE it's open, so closing it from
+      // Chrome's UI (which fires onRemoved after the tabs are already gone)
+      // doesn't lose the tab list.
+      g.title = liveMatch.title || g.title;
+      g.color = liveMatch.color || g.color;
+      g.tabCount = liveMatch.tabCount;
+      if (Array.isArray(liveMatch.tabs) && liveMatch.tabs.length) {
+        g.tabs = liveMatch.tabs;
+        g.tabsLoaded = true;
+      }
     }
   }
 
   // Only persist + broadcast if something actually changed (avoids spurious
   // file-backup triggers every time any tab event fires).
-  const newSig = groups.map(g => `${g.uid}:${g.active}:${g.chromeGroupId}:${g.openWindowId}`).join("|");
-  if (groups.length !== oldLen || newSig !== oldSig) {
+  if (sig(groups) !== oldSig) {
     await setStore({ savedGroups: groups });
     broadcast({ type: "STORE_UPDATED" });
   }
@@ -542,7 +620,10 @@ async function listChromeProfiles() {
   return second?.ok ? second : (second || first);
 }
 
-function importFromChrome(profileDirs = null) {
+// Read saved tab groups from the chosen profile(s) via the native host WITHOUT
+// saving anything. Resolves { ok, data } so callers can either import directly
+// or show the user a picker first.
+function _nativeExtract(profileDirs = null) {
   return _withNativeLock(() => new Promise((resolve) => {
     let settled = false;
     const finish = (result) => {
@@ -556,7 +637,7 @@ function importFromChrome(profileDirs = null) {
     // export as multiple "extractChunk" messages, then a final "extractResult".
     const chunks = [];
     const port = _connectNative(
-      async (msg) => {
+      (msg) => {
         if (msg?.action === "extractChunk") {
           chunks[msg.index] = msg.data;
           return;
@@ -574,8 +655,7 @@ function importFromChrome(profileDirs = null) {
         } else {
           data = msg.data; // backward-compat with old single-message host
         }
-        const res = await importStore(data);
-        finish({ ok: true, added: res.added, total: (data?.savedGroups || []).length });
+        finish({ ok: true, data });
       },
       (err) => finish({ ok: false, error: err })
     );
@@ -586,6 +666,16 @@ function importFromChrome(profileDirs = null) {
     );
     port.postMessage({ action: "extract", profileDirs });
   }));
+}
+
+async function importFromChrome(profileDirs = null) {
+  const res = await _nativeExtract(profileDirs);
+  if (!res.ok) return { ok: false, error: res.error };
+  const deleted = await getDeletedKeys();
+  const all = res.data?.savedGroups || [];
+  const groups = all.filter((g) => !deleted.has(groupSignature(g)));
+  const r = await importStore({ ...res.data, savedGroups: groups });
+  return { ok: true, added: r.added, total: all.length };
 }
 
 async function importStore(data) {
@@ -735,6 +825,29 @@ const handlers = {
 
   async importFromChrome({ profileDirs } = {}) {
     return importFromChrome(profileDirs || null);
+  },
+
+  // Read groups from the chosen profile(s) WITHOUT saving — lets the side panel
+  // show a picker so the user imports only the groups they actually want
+  // (Chrome's sync DB holds every group from all their devices/accounts).
+  async extractChromeGroups({ profileDirs } = {}) {
+    const res = await _nativeExtract(profileDirs || null);
+    if (!res.ok) return { ok: false, error: res.error };
+    // Hide groups the user previously deleted so they don't keep coming back.
+    const deleted = await getDeletedKeys();
+    const all = res.data?.savedGroups || [];
+    const filtered = all.filter((g) => !deleted.has(groupSignature(g)));
+    return {
+      ok: true,
+      savedGroups: filtered,
+      folders: res.data?.folders || [],
+      hidden: all.length - filtered.length,
+    };
+  },
+
+  async clearImportHistory() {
+    await chrome.storage.local.remove(DELETED_KEYS);
+    return { ok: true };
   },
 
   async loadGroupTabs({ groupUid }) {
@@ -949,7 +1062,9 @@ const handlers = {
 
   async deleteGroup({ groupUid }) {
     const store = await getStore();
+    const removed = store.savedGroups.find((g) => g.uid === groupUid);
     const savedGroups = store.savedGroups.filter((g) => g.uid !== groupUid);
+    if (removed) await addDeletedKeys([removed]); // remember it so import won't re-add it
     await setStore({ savedGroups });
     broadcast({ type: "STORE_UPDATED" });
     return { ok: true };
@@ -998,6 +1113,7 @@ const handlers = {
     const store = await getStore();
     if (store.savedGroups.some(g => g.uid === group.uid)) return { ok: true };
     store.savedGroups.unshift(normalizeGroup({ ...group, active: false, openWindowId: null, chromeGroupId: null }));
+    await removeDeletedKeys([group]); // undo: clear its tombstone
     await setStore({ savedGroups: store.savedGroups });
     broadcast({ type: "STORE_UPDATED" });
     return { ok: true };
@@ -1016,6 +1132,7 @@ const handlers = {
       restored++;
     }
     if (restored) {
+      await removeDeletedKeys(groups); // undo: clear their tombstones
       await setStore({ savedGroups: store.savedGroups });
       broadcast({ type: "STORE_UPDATED" });
     }
@@ -1153,7 +1270,9 @@ const handlers = {
     if (!Array.isArray(groupUids) || !groupUids.length) return { ok: false };
     const toDelete = new Set(groupUids);
     const store = await getStore();
+    const removed = store.savedGroups.filter((g) => toDelete.has(g.uid));
     const savedGroups = store.savedGroups.filter((g) => !toDelete.has(g.uid));
+    if (removed.length) await addDeletedKeys(removed); // remember them so import won't re-add
     await setStore({ savedGroups });
     broadcast({ type: "STORE_UPDATED" });
     return { ok: true, deleted: groupUids.length };
@@ -1220,19 +1339,30 @@ const handlers = {
   async updateSettings({ settings }) {
     return { ok: true, settings: await setSettings(settings || {}) };
   },
+
+  // Pages call this on load to decide whether to OFFER a data recovery.
+  async getRecoveryStatus() {
+    return getRecoveryStatus();
+  },
+
+  // Pages call this ONLY after the user explicitly clicks Restore. Merge-only.
+  async applyRecovery(msg) {
+    return applyRecovery(msg || {});
+  },
 };
 
-// On startup: restore active-window tracking first (survives SW idle restarts),
-// then cloud backup, then file backup, then reconcile.
-// Startup restore priority:
-// 1. _awRestore   — in-memory window tracking (session storage)
-// 2. restoreFromFileBackup — full tab URLs preserved (v4 format), preferred
-// 3. restoreFromCloud     — last resort; only tab counts, no URLs
-// Both backup restores skip when local storage is already non-empty.
-_awRestore()
-  .then(() => restoreFromFileBackup())
-  .then(() => restoreFromCloud())
-  .then(() => reconcile());
+// On startup, the extension does the BARE MINIMUM and NEVER pulls in groups:
+// 1. _awRestore — rebuild in-memory tracking of windows this extension opened
+//                 (from session storage); touches no saved groups.
+// 2. reconcile  — flip active/inactive to match what's really open. It does NOT
+//                 capture, import, restore, or delete anything.
+//
+// There is intentionally NO automatic restore of any kind. The old startup
+// auto-restored a machine-shared file backup whenever local looked empty, which
+// pulled another profile/account's data in and overwrote this profile's groups.
+// Recovery is now strictly opt-in: pages call getRecoveryStatus and OFFER it;
+// applyRecovery runs only on an explicit click and merges (never overwrites).
+_awRestore().then(() => reconcile());
 
 // Keyboard shortcut: Ctrl+Shift+G → save focused window as group
 chrome.commands.onCommand.addListener(async (command) => {

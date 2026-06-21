@@ -80,13 +80,13 @@ def main():
                 send_message({"action": "extractResult", "ok": False, "error": str(exc)})
         elif action == "saveBackup":
             try:
-                ok = tabgroups.save_backup(message.get("data") or {})
+                ok = tabgroups.save_backup(message.get("data") or {}, message.get("key"))
                 send_message({"action": "saveBackupResult", "ok": ok})
             except Exception as exc:
                 send_message({"action": "saveBackupResult", "ok": False, "error": str(exc)})
         elif action == "loadBackup":
             try:
-                data = tabgroups.load_backup()
+                data = tabgroups.load_backup(message.get("key"))
                 if data is None:
                     send_message({"action": "loadBackupResult", "ok": False, "data": None})
                 else:

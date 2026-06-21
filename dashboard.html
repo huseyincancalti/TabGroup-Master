@@ -144,9 +144,6 @@
             <button id="btn-refresh-workspace" class="header-glass-btn" type="button" title="Refresh" aria-label="Refresh">
               <span aria-hidden="true">🔄</span>
             </button>
-            <button id="btn-reset-workspace" class="header-glass-btn header-glass-btn-danger" type="button" title="Reset Everything" aria-label="Reset Everything">
-              <span aria-hidden="true">🗑️</span>
-            </button>
             <button id="btn-new-folder" class="btn-primary" type="button">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
               New Folder
@@ -338,6 +335,20 @@
                 <p class="diag-guide-note">Your saved groups are stored inside the extension and are <strong>never affected</strong> by a host disconnect — only Import and Backup use the host.</p>
               </div>
             </details>
+          </article>
+
+          <article class="settings-card glass-panel settings-card-danger">
+            <div class="settings-card-header">
+              <span class="settings-card-icon">⚠️</span>
+              <div>
+                <h3>Danger zone</h3>
+                <p class="settings-desc">Reset wipes every saved group and folder (export a backup first — this can't be undone). Clearing import history lets groups you previously deleted appear again the next time you import from Chrome.</p>
+              </div>
+            </div>
+            <div class="settings-actions settings-actions-sm">
+              <button id="btn-clear-import-history" class="btn-secondary" type="button">↺ Clear import history</button>
+              <button id="btn-reset-workspace" class="btn-danger-outline" type="button">🗑️ Reset everything</button>
+            </div>
           </article>
 
         </div>

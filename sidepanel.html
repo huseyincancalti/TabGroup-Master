@@ -29,11 +29,13 @@
         <h1>TabGroup Master</h1>
       </div>
       <div class="header-actions">
+        <button id="btn-select-mode" class="header-glass-btn" type="button" title="Select multiple to delete" aria-label="Select multiple to delete">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+          </svg>
+        </button>
         <button id="btn-refresh-workspace" class="header-glass-btn" type="button" title="Refresh" aria-label="Refresh">
           <span aria-hidden="true">🔄</span>
-        </button>
-        <button id="btn-reset-workspace" class="header-glass-btn header-glass-btn-danger" type="button" title="Reset Everything" aria-label="Reset Everything">
-          <span aria-hidden="true">🗑️</span>
         </button>
       </div>
     </div>
@@ -85,6 +87,13 @@
     </button>
   </div>
 
+  <div id="selection-bar" class="selection-bar hidden" role="toolbar" aria-label="Bulk actions">
+    <button id="sel-all" class="sel-bar-btn" type="button">Select all</button>
+    <span id="sel-count" class="sel-count">0 selected</span>
+    <button id="sel-delete" class="sel-bar-btn sel-bar-delete" type="button" disabled>Delete</button>
+    <button id="sel-cancel" class="sel-bar-btn" type="button">Done</button>
+  </div>
+
   <main id="content">
     <section id="pane-active" class="pane">
       <div id="active-groups-list" class="groups-container"></div>
@@ -109,18 +118,6 @@
       </div>
     </section>
   </main>
-
-  <div id="sp-reset-overlay" class="hidden" role="dialog" aria-modal="true" aria-labelledby="sp-reset-heading">
-    <div class="sp-reset-card">
-      <div class="sp-reset-glow" aria-hidden="true"></div>
-      <h2 id="sp-reset-heading">⚠️ Reset</h2>
-      <p class="sp-reset-text">Are you sure you want to nuke your entire workspace? This will delete all saved groups and folders.</p>
-      <div class="sp-reset-actions">
-        <button id="sp-reset-cancel" class="wizard-btn wizard-btn-muted" type="button">Cancel</button>
-        <button id="sp-reset-confirm" class="wizard-btn wizard-btn-neon-red" type="button">Yes, Nuke It</button>
-      </div>
-    </div>
-  </div>
 
   <div id="edit-modal-overlay" class="hidden">
     <div id="edit-modal" class="glass-modal">
@@ -164,7 +161,28 @@
         </button>
       </div>
     </div>
-    <!-- Step 2: Importing spinner -->
+    <!-- Step 2: Choose which groups to import -->
+    <div id="step-groups" class="capture-card hidden">
+      <div class="capture-glow" aria-hidden="true"></div>
+      <h2 class="picker-heading">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        Choose groups
+      </h2>
+      <p class="capture-text">Only the groups you tick are imported — Chrome syncs groups from all your devices into one place, so untick anything you don't want.</p>
+      <div class="group-pick-toolbar">
+        <button id="grouppick-all" class="sel-bar-btn" type="button">Select all</button>
+        <span id="grouppick-count" class="sel-count">0 selected</span>
+      </div>
+      <div id="grouppick-list" class="profile-list"></div>
+      <div class="profile-actions">
+        <button id="btn-grouppick-cancel" class="btn-secondary-sp" type="button">Cancel</button>
+        <button id="btn-grouppick-confirm" class="btn-primary-sp" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Import selected
+        </button>
+      </div>
+    </div>
+    <!-- Step 3: Importing spinner -->
     <div id="step-importing" class="capture-card hidden">
       <div class="capture-glow" aria-hidden="true"></div>
       <div class="import-spinner" aria-hidden="true"></div>

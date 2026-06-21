@@ -34,6 +34,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   bindListeners();
   await loadSettings();
   render();
+  checkRecoveryOffer();
 
   // Deep-link: dashboard.html#settings jumps straight to the Settings view.
   if (location.hash === "#settings" && typeof switchView === "function") {
@@ -107,9 +108,15 @@ async function loadSettings() {
 // Storage-event driven updates: reliable regardless of how many extension
 // pages are open. Avoids the async-onMessage channel collision that caused
 // the native-host port to drop when dashboard + sidepanel were both open.
+// While the user is dragging (and just after a drop) we skip the re-render that
+// our own storage writes would trigger — SortableJS has already placed the node
+// exactly where it was dropped, so re-rendering would only cause a scroll jump
+// and undo the placement.
+let _suppressTreeRenderUntil = 0;
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   if (changes.savedGroups || changes.folders) {
+    if (Date.now() < _suppressTreeRenderUntil) return;
     loadData().then(() => render()).catch(() => {});
   }
 });
@@ -118,12 +125,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // Non-async so the message channel closes immediately — no stuck channels.
 chrome.runtime.onMessage.addListener((message) => {
   if (!message) return;
-  if (message.type === "RESTORED_FROM_CLOUD") {
-    loadData().then(() => {
-      render();
-      showToast(`♻️ Restored ${message.groupCount} groups + ${message.folderCount} folders from sync backup`, "info");
-    }).catch(() => {});
-  } else if (message.type === "RESTORED_FROM_BACKUP") {
+  if (message.type === "RESTORED_FROM_BACKUP") {
     loadData().then(() => {
       render();
       showToast(`✅ Data restored! ${message.groupCount} groups + ${message.folderCount} folders recovered from local backup.`, "success");
@@ -151,14 +153,15 @@ function sendMsg(message) {
 }
 
 async function loadData() {
-  let store = await sendMsg({ action: "getStore" });
-
-  if (!store) {
-    // Service worker unresponsive — read directly from chrome.storage.local as fallback
-    try {
-      const raw = await chrome.storage.local.get(["savedGroups", "folders"]);
-      store = { savedGroups: raw.savedGroups || [], folders: raw.folders || [] };
-    } catch (_) { return; }
+  // Read straight from chrome.storage.local — instant source of truth, so the
+  // dashboard paints without waiting on a possibly-cold MV3 service worker.
+  // The SW is only needed for mutations; storage.onChanged re-syncs after them.
+  let store;
+  try {
+    const raw = await chrome.storage.local.get(["savedGroups", "folders"]);
+    store = { savedGroups: raw.savedGroups || [], folders: raw.folders || [] };
+  } catch (_) {
+    store = await sendMsg({ action: "getStore" });
   }
   if (!store) return;
 
@@ -280,19 +283,15 @@ function getChildFolders(parentId) {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
+// Groups keep the order they sit in `savedGroups` (which buildIndexes preserves)
+// rather than being force-sorted alphabetically — so when you drag a group to a
+// spot, it STAYS there instead of jumping to an alphabetical position.
 function getChildGroups(folderId) {
-  return (state.childGroupsByFolder.get(folderId) || [])
-    .slice()
-    .sort((a, b) => {
-      if (a.active !== b.active) return a.active ? -1 : 1;
-      return (a.title || "").localeCompare(b.title || "");
-    });
+  return (state.childGroupsByFolder.get(folderId) || []).slice();
 }
 
 function getInboxGroups() {
-  return (state.inboxGroups || [])
-    .slice()
-    .sort((a, b) => (a.title || "").localeCompare(b.title || ""));
+  return (state.inboxGroups || []).slice();
 }
 
 function resolveTargetFolderId(folderIdAttr) {
@@ -502,6 +501,59 @@ function buildFolderNode(folder) {
   return wrapper;
 }
 
+// A second way to categorize (besides drag-and-drop): a compact dropdown that
+// moves a group straight into any folder — or back to the Inbox — in one click.
+function closeMoveMenu() {
+  document.getElementById("move-menu")?.remove();
+  document.removeEventListener("click", closeMoveMenu);
+}
+
+function openMoveMenu(group, anchorEl) {
+  closeMoveMenu();
+  const menu = document.createElement("div");
+  menu.id = "move-menu";
+  menu.className = "move-menu";
+
+  const targets = [{ id: null, label: "📥 Inbox" }];
+  getChildFolders(null).forEach((f) => addFolderOptions(f, 0, targets));
+
+  targets.forEach((t) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    const isCurrent = (group.folderId ?? null) === t.id;
+    btn.className = "move-menu-item" + (isCurrent ? " current" : "");
+    btn.style.paddingLeft = `${12 + (t.depth || 0) * 14}px`;
+    btn.textContent = t.label;
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      closeMoveMenu();
+      if (isCurrent) return;
+      const g = state.groupIndex.get(group.uid);
+      if (g) { g.folderId = t.id; buildIndexes(); }
+      await sendMsg({ action: "moveItem", itemType: "group", itemId: group.uid, targetFolderId: t.id });
+      await loadData();
+      renderTree();
+      showToast(t.id ? `Moved to ${state.folderIndex.get(t.id)?.name || "folder"}` : "Moved to Inbox", "success");
+    });
+    menu.appendChild(btn);
+  });
+
+  document.body.appendChild(menu);
+  const r = anchorEl.getBoundingClientRect();
+  const top = Math.min(r.bottom + 4, window.innerHeight - menu.offsetHeight - 8);
+  const left = Math.min(r.left, window.innerWidth - menu.offsetWidth - 8);
+  menu.style.top = `${Math.max(8, top)}px`;
+  menu.style.left = `${Math.max(8, left)}px`;
+  // Defer so this same click doesn't immediately close the menu.
+  setTimeout(() => document.addEventListener("click", closeMoveMenu), 0);
+}
+
+// Flatten the folder tree into indented options for the move menu.
+function addFolderOptions(folder, depth, out) {
+  out.push({ id: folder.id, label: "📁 " + folder.name, depth: depth + 1 });
+  getChildFolders(folder.id).forEach((child) => addFolderOptions(child, depth + 1, out));
+}
+
 function buildGroupNode(group, options = {}) {
   const inInbox = options.inInbox === true;
   const node = document.createElement("div");
@@ -514,6 +566,7 @@ function buildGroupNode(group, options = {}) {
   const title = escHtml(group.title || "Unnamed Group");
   const statusClass = group.active ? "active" : "saved";
   const statusLabel = group.active ? "Active" : "Saved";
+  const unst = group.tabsUnstored ? `<span class="unstored-badge">sync only</span>` : "";
   const removeBtn = inInbox
     ? ""
     : `<button class="action-remove" type="button" title="Remove from folder (send to Inbox)">
@@ -533,8 +586,14 @@ function buildGroupNode(group, options = {}) {
     <span class="tree-group-dot" style="background:${dot}"></span>
     <span class="tree-group-title" title="${title}">${title}</span>
     <span class="tree-group-meta">${tabs} tab${tabs !== 1 ? "s" : ""}</span>
+    ${unst}
     <span class="tree-group-status ${statusClass}">${statusLabel}</span>
     <div class="tree-group-actions">
+      <button class="action-move" type="button" title="Move to folder">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+        </svg>
+      </button>
       <button class="action-view" type="button" title="${group.active ? "Focus group" : "Restore group"}">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
@@ -544,6 +603,11 @@ function buildGroupNode(group, options = {}) {
       ${removeBtn}
     </div>
   `;
+
+  node.querySelector(".action-move").addEventListener("click", (e) => {
+    e.stopPropagation();
+    openMoveMenu(group, e.currentTarget);
+  });
 
   node.querySelector(".action-view").addEventListener("click", async (e) => {
     e.stopPropagation();
@@ -583,61 +647,87 @@ function buildGroupNode(group, options = {}) {
   return node;
 }
 
+const TAB_PREVIEW_LIMIT = 50;
+
+function _makeTabListItem(t, itemClass) {
+  const li = document.createElement("li");
+  li.className = itemClass;
+  const url = t.url || "";
+  const title = t.title || url || "Untitled";
+  const isLink = isSafeHref(url);
+  if (isLink) {
+    const a = document.createElement("a");
+    a.href = url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.title = url;
+    a.className = "tree-tab-link";
+    if (t.favIconUrl) {
+      const img = document.createElement("img");
+      img.src = t.favIconUrl;
+      img.className = "tree-tab-favicon";
+      img.alt = "";
+      img.onerror = () => img.replaceWith(makeFaviconPlaceholder());
+      a.appendChild(img);
+    } else {
+      a.appendChild(makeFaviconPlaceholder());
+    }
+    const span = document.createElement("span");
+    span.className = "tree-tab-title";
+    span.textContent = title;
+    a.appendChild(span);
+    try {
+      const u = new URL(url);
+      const path = (u.hostname + u.pathname + u.search).replace(/^www\./, "");
+      const hint = path.length > 55 ? path.slice(0, 52) + "…" : path;
+      if (hint && hint.toLowerCase() !== title.toLowerCase().slice(0, hint.length)) {
+        const domSpan = document.createElement("span");
+        domSpan.className = "cleanup-tab-domain";
+        domSpan.textContent = hint;
+        a.appendChild(domSpan);
+      }
+    } catch (_) {}
+    li.appendChild(a);
+  } else {
+    li.textContent = title;
+    li.style.color = "var(--text-muted)";
+  }
+  return li;
+}
+
+function _appendTabBatch(listEl, tabs, startIdx, itemClass) {
+  const frag = document.createDocumentFragment();
+  tabs.slice(startIdx).forEach((t) => frag.appendChild(_makeTabListItem(t, itemClass)));
+  listEl.appendChild(frag);
+}
+
+function _addShowMoreBtn(listEl, tabs, shown, itemClass) {
+  const remaining = tabs.length - shown;
+  if (remaining <= 0) return;
+  const li = document.createElement("li");
+  li.className = "tab-show-more";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = `Show ${remaining} more tab${remaining !== 1 ? "s" : ""}…`;
+  btn.addEventListener("click", () => {
+    li.remove();
+    _appendTabBatch(listEl, tabs, shown, itemClass);
+  });
+  li.appendChild(btn);
+  listEl.appendChild(li);
+}
+
 function renderTreeTabsList(listEl, tabs) {
   listEl.innerHTML = "";
   if (!tabs.length) {
     listEl.innerHTML = '<li class="tree-group-tab-empty">No tabs stored — Restore to open in Chrome</li>';
     return;
   }
+  const preview = tabs.slice(0, TAB_PREVIEW_LIMIT);
   const frag = document.createDocumentFragment();
-  tabs.forEach((t) => {
-    const li = document.createElement("li");
-    li.className = "tree-group-tab-item";
-    const url = t.url || "";
-    const title = t.title || url || "Untitled";
-    const isLink = isSafeHref(url);
-    if (isLink) {
-      const a = document.createElement("a");
-      a.href = url;
-      a.target = "_blank";
-      a.rel = "noopener noreferrer";
-      a.title = url;
-      a.className = "tree-tab-link";
-      // Favicon
-      if (t.favIconUrl) {
-        const img = document.createElement("img");
-        img.src = t.favIconUrl;
-        img.className = "tree-tab-favicon";
-        img.alt = "";
-        img.onerror = () => img.replaceWith(makeFaviconPlaceholder());
-        a.appendChild(img);
-      } else {
-        a.appendChild(makeFaviconPlaceholder());
-      }
-      const span = document.createElement("span");
-      span.className = "tree-tab-title";
-      span.textContent = title;
-      a.appendChild(span);
-      // URL path hint — shows "youtube.com/watch?v=…" so generic titles are actionable
-      try {
-        const u = new URL(url);
-        const path = (u.hostname + u.pathname + u.search).replace(/^www\./, "");
-        const hint = path.length > 55 ? path.slice(0, 52) + "…" : path;
-        if (hint && hint.toLowerCase() !== title.toLowerCase().slice(0, hint.length)) {
-          const domSpan = document.createElement("span");
-          domSpan.className = "cleanup-tab-domain";
-          domSpan.textContent = hint;
-          a.appendChild(domSpan);
-        }
-      } catch (_) {}
-      li.appendChild(a);
-    } else {
-      li.textContent = title;
-      li.style.color = "var(--text-muted)";
-    }
-    frag.appendChild(li);
-  });
+  preview.forEach((t) => frag.appendChild(_makeTabListItem(t, "tree-group-tab-item")));
   listEl.appendChild(frag);
+  _addShowMoreBtn(listEl, tabs, TAB_PREVIEW_LIMIT, "tree-group-tab-item");
 }
 
 function makeFaviconPlaceholder() {
@@ -817,62 +907,11 @@ function _renderCleanupTabsList(listEl, tabs) {
     listEl.appendChild(li);
     return;
   }
+  const preview = tabs.slice(0, TAB_PREVIEW_LIMIT);
   const frag = document.createDocumentFragment();
-  tabs.forEach((t) => {
-    const li = document.createElement("li");
-    li.className = "cleanup-tab-item";
-    const url = t.url || "";
-    const title = t.title || url || "Untitled";
-    const isLink = isSafeHref(url);
-
-    if (isLink) {
-      const a = document.createElement("a");
-      a.href = url;
-      a.target = "_blank";
-      a.rel = "noopener noreferrer";
-      a.title = url;              // full URL shown on hover
-      a.className = "tree-tab-link";  // reuse workspace styles
-
-      // Favicon
-      if (t.favIconUrl) {
-        const img = document.createElement("img");
-        img.src = t.favIconUrl;
-        img.className = "tree-tab-favicon";
-        img.alt = "";
-        img.onerror = () => img.replaceWith(makeFaviconPlaceholder());
-        a.appendChild(img);
-      } else {
-        a.appendChild(makeFaviconPlaceholder());
-      }
-
-      // Title
-      const titleSpan = document.createElement("span");
-      titleSpan.className = "tree-tab-title";
-      titleSpan.textContent = title;
-      a.appendChild(titleSpan);
-
-      // URL path hint — e.g. "youtube.com/watch?v=abc123" tells you WHICH YouTube page
-      try {
-        const u = new URL(url);
-        const path = (u.hostname + u.pathname + u.search).replace(/^www\./, "");
-        const hint = path.length > 64 ? path.slice(0, 61) + "…" : path;
-        if (hint && hint.toLowerCase() !== title.toLowerCase().slice(0, hint.length)) {
-          const domSpan = document.createElement("span");
-          domSpan.className = "cleanup-tab-domain";
-          domSpan.textContent = hint;
-          a.appendChild(domSpan);
-        }
-      } catch (_) { /* ignore bad URLs */ }
-
-      li.appendChild(a);
-    } else {
-      // Non-navigable (chrome:// etc.) — plain text
-      li.textContent = title;
-      li.style.color = "var(--text-muted)";
-    }
-    frag.appendChild(li);
-  });
+  preview.forEach((t) => frag.appendChild(_makeTabListItem(t, "cleanup-tab-item")));
   listEl.appendChild(frag);
+  _addShowMoreBtn(listEl, tabs, TAB_PREVIEW_LIMIT, "cleanup-tab-item");
 }
 
 function renderCleanupUnnamed() {
@@ -884,7 +923,12 @@ function renderCleanupUnnamed() {
   const groups = state.savedGroups.filter((g) => {
     if (g.active) return false;
     const t = (g.title || "").trim();
-    const isUnnamed = t.length <= 1 || (g.tabCount || 0) === 0;
+    // A "ghost": claims to hold tabs but none are actually stored and there's no
+    // way to recover them (not a cloud-restored group, which is labeled instead).
+    // These were created by the old auto-capture bug — surface them so they can
+    // be purged in one click.
+    const isGhost = (g.tabs || []).length === 0 && !g.tabsUnstored;
+    const isUnnamed = t.length <= 1 || (g.tabCount || 0) === 0 || isGhost;
     if (!isUnnamed) return false;
     return q ? normalizeText(t || "unnamed").includes(q) : true;
   });
@@ -905,7 +949,9 @@ function renderCleanupUnnamed() {
     const row = document.createElement("div");
     row.className = "cleanup-row";
     const dot = COLOR_HEX[group.color] || COLOR_HEX.grey;
-    const tabs = group.tabCount || 0;
+    // Show the REAL stored tab count, not the cached tabCount — a ghost group
+    // claims "3 tabs" but stores none, so this honestly reads "0 tabs".
+    const tabs = (group.tabs || []).length || (group.tabsUnstored ? (group.tabCount || 0) : 0);
     const displayTitle = (group.title || "").trim() || "Unnamed";
     row.innerHTML = `
       <input type="checkbox" class="cleanup-check" />
@@ -954,6 +1000,17 @@ function renderCleanupUnnamed() {
   container.appendChild(frag);
 }
 
+// Broad duplicate key: collapse separators and strip a trailing number/suffix
+// so "koke" ≈ "koke11", "Kolento" ≈ "Kolento11", "Work 2" ≈ "Work". Falls back
+// to the exact normalized title for all-numeric names so "1" and "2" don't merge.
+function fuzzyDupKey(title) {
+  const base = normalizeText(title || "");
+  const stripped = base
+    .replace(/[\s\-_.]+/g, "")   // drop spaces, -, _, .
+    .replace(/\d+$/, "");        // drop a trailing number ("koke11" → "koke")
+  return stripped || base;
+}
+
 function renderCleanupDuplicates() {
   const container = document.getElementById("cleanup-duplicates-list");
   const badge = document.getElementById("cleanup-duplicates-badge");
@@ -962,7 +1019,7 @@ function renderCleanupDuplicates() {
   const byTitle = new Map();
   for (const g of state.savedGroups) {
     if (g.active) continue;
-    const key = normalizeText(g.title || "");
+    const key = fuzzyDupKey(g.title || "");
     if (!key) continue;
     if (!byTitle.has(key)) byTitle.set(key, []);
     byTitle.get(key).push(g);
@@ -1137,25 +1194,41 @@ function initSortableEverywhere() {
           return;
         }
 
-        // Optimistic state update — SortableJS already moved the DOM node
+        // Optimistic state update — SortableJS already moved the DOM node, so we
+        // leave it exactly where the user dropped it (no re-render → no scroll
+        // jump, and the item doesn't snap back to an alphabetical slot).
         if (itemType === "group") {
           const g = state.groupIndex?.get(itemId);
-          if (g) { g.folderId = targetFolderId; buildIndexes(); }
+          if (g) { g.folderId = targetFolderId; }
         } else if (itemType === "folder") {
           const f = state.folderIndex?.get(itemId);
-          if (f) { f.parentId = targetFolderId; buildIndexes(); }
+          if (f) { f.parentId = targetFolderId; }
         }
 
-        // Fire to background asynchronously — no UI block
-        sendMsg({ action: "moveItem", itemType, itemId, targetFolderId })
-          .then(async (res) => {
-            if (!res?.ok) {
-              showToast("Move blocked (cycle or invalid)", "error");
-              await loadData();
-              renderTree();
-            }
-            // On success, storage.onChanged triggers a background reconcile
-          });
+        // Capture the new on-screen group order and make state match it, so the
+        // drop STICKS across any later render instead of reverting.
+        const domOrder = [...document.querySelectorAll(".tree-group[data-group-uid]")]
+          .map((el) => el.dataset.groupUid);
+        const seen = new Set(domOrder);
+        const byUid = new Map(state.savedGroups.map((g) => [g.uid, g]));
+        const reordered = domOrder.map((u) => byUid.get(u)).filter(Boolean);
+        const rest = state.savedGroups.filter((g) => !seen.has(g.uid));
+        state.savedGroups = [...reordered, ...rest];
+        buildIndexes();
+
+        // Ignore the storage echo from our own writes for a moment.
+        _suppressTreeRenderUntil = Date.now() + 1500;
+
+        const moveRes = await sendMsg({ action: "moveItem", itemType, itemId, targetFolderId });
+        if (!moveRes?.ok) {
+          _suppressTreeRenderUntil = 0;
+          showToast("Move blocked (cycle or invalid)", "error");
+          await loadData();
+          renderTree();
+          return;
+        }
+        // Persist the new manual order (folder membership already saved above).
+        sendMsg({ action: "reorderGroups", orderedUids: state.savedGroups.map((g) => g.uid) });
       },
     });
     sortableInstances.push(instance);
@@ -1226,12 +1299,48 @@ async function confirmResetWorkspace() {
   });
   if (!ok) return;
   closeResetWorkspaceModal();
-  await chrome.storage.local.remove(["savedGroups", "folders"]);
+  // True clean slate: also forget the deleted-group history so a fresh import
+  // can bring everything back.
+  await chrome.storage.local.remove(["savedGroups", "folders", "deletedGroupKeys"]);
   state.savedGroups = [];
   state.folders = [];
   buildIndexes();
   render();
   showToast("Workspace reset", "success");
+}
+
+// Offer (never force) a one-click recovery if a backup holds groups not in this
+// profile. Restoring MERGES — it never overwrites or deletes existing groups.
+async function checkRecoveryOffer() {
+  if (document.getElementById("cloud-restore-banner")) return;
+  const res = await sendMsg({ action: "getRecoveryStatus" });
+  if (!res?.available) return;
+  const banner = document.createElement("div");
+  banner.id = "cloud-restore-banner";
+  const count = res.groupCount || 0;
+  const where = res.source === "file" ? "local backup" : "cloud backup";
+  const tabsNote = res.hasTabs ? "with full tabs" : "titles only";
+  banner.innerHTML = `
+    <span class="cloud-banner-text">💾 ${count} group${count !== 1 ? "s" : ""} available in your ${where} (${tabsNote}). Restore them into this workspace?</span>
+    <button class="cloud-banner-restore" type="button">Restore</button>
+    <button class="cloud-banner-dismiss" type="button" title="Dismiss">✕</button>`;
+  banner.querySelector(".cloud-banner-restore").addEventListener("click", async () => {
+    banner.remove();
+    const applyRes = await sendMsg({ action: "applyRecovery", source: res.source });
+    if (applyRes?.ok) {
+      await loadData();
+      render();
+      const n = applyRes.restored || 0;
+      const tail = res.hasTabs ? "" : " — open each once to reload URLs";
+      showToast(`Recovered ${n} group${n !== 1 ? "s" : ""}${tail}`, "success");
+    } else {
+      showToast("Recovery failed", "error");
+    }
+  });
+  banner.querySelector(".cloud-banner-dismiss").addEventListener("click", () => banner.remove());
+  // Insert at the top of the active view's content area
+  const main = document.querySelector(".dashboard-main");
+  main?.insertAdjacentElement("afterbegin", banner);
 }
 
 function bindListeners() {
@@ -1451,6 +1560,17 @@ function bindListeners() {
       btn.disabled = false;
       btn.textContent = "📡 Test Connection";
     }
+  });
+
+  document.getElementById("btn-clear-import-history")?.addEventListener("click", async () => {
+    const ok = await showModal({
+      title: "Clear import history?",
+      body: "Groups you previously deleted will be allowed to appear again the next time you import from Chrome. Your current groups are not affected.",
+      confirmText: "Clear", cancelText: "Cancel", icon: "↺",
+    });
+    if (!ok) return;
+    await sendMsg({ action: "clearImportHistory" });
+    showToast("Import history cleared", "success");
   });
 
   document.getElementById("btn-refresh-workspace")?.addEventListener("click", refreshWorkspace);
