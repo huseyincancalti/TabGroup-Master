@@ -870,6 +870,101 @@ function startInlineGroupRename(group, nodeEl, titleEl) {
 function renderCleanup() {
   renderCleanupUnnamed();
   renderCleanupDuplicates();
+  renderCleanupDuplicateTabs();
+}
+
+// ── Tab-level dedup (mirrors background.js logic, client-side for counting) ──
+
+const _TAB_TRACKING_PARAMS = [
+  "utm_source","utm_medium","utm_campaign","utm_term","utm_content",
+  "fbclid","gclid","_ga","_gl","ref","source",
+];
+
+function _normTabUrl(url) {
+  if (!url) return "";
+  try {
+    const u = new URL(url);
+    _TAB_TRACKING_PARAMS.forEach(p => u.searchParams.delete(p));
+    u.hash = "";
+    u.hostname = u.hostname.toLowerCase().replace(/^www\./, "");
+    if (u.pathname.length > 1) u.pathname = u.pathname.replace(/\/$/, "");
+    return u.toString();
+  } catch (_) { return url.trim().toLowerCase(); }
+}
+
+function _normTabTitle(title) {
+  if (!title) return "";
+  return title.trim()
+    .replace(/\s*[–\-]\s*\d+\s*$/, "")
+    .replace(/\s*#\d+\s*$/, "")
+    .replace(/\s*\(\d+\)\s*$/, "")
+    .toLowerCase();
+}
+
+function _countTabDuplicates(tabs) {
+  const seenUrls = new Map();
+  const seenTitleKeys = new Map();
+  let count = 0;
+  (tabs || []).forEach((t) => {
+    if (!t.url) return;
+    const normUrl = _normTabUrl(t.url);
+    if (seenUrls.has(normUrl)) { count++; return; }
+    seenUrls.set(normUrl, true);
+    const normTitle = _normTabTitle(t.title || "");
+    if (normTitle.length > 4) {
+      try {
+        const host = new URL(t.url).hostname.replace(/^www\./, "").toLowerCase();
+        const key = `${host}::${normTitle}`;
+        if (seenTitleKeys.has(key)) { count++; return; }
+        seenTitleKeys.set(key, true);
+      } catch (_) {}
+    }
+  });
+  return count;
+}
+
+function renderCleanupDuplicateTabs() {
+  const container = document.getElementById("cleanup-dup-tabs-list");
+  const badge = document.getElementById("cleanup-dup-tabs-badge");
+  if (!container) return;
+
+  const filter = (state.cleanupFilter || "").toLowerCase();
+  const groups = (state.groups || [])
+    .map(g => ({ g, dups: _countTabDuplicates(g.tabs) }))
+    .filter(({ g, dups }) => dups > 0 && (!filter || (g.title || "").toLowerCase().includes(filter)))
+    .sort((a, b) => b.dups - a.dups);
+
+  if (badge) badge.textContent = String(groups.length);
+
+  if (!groups.length) {
+    container.innerHTML = '<p class="cleanup-empty">No groups with duplicate tabs.</p>';
+    return;
+  }
+
+  container.innerHTML = "";
+  for (const { g, dups } of groups) {
+    const dot = colorDot(g.color);
+    const el = document.createElement("div");
+    el.className = "cleanup-group-node";
+    el.innerHTML = `
+      <div class="cleanup-group-header">
+        <span class="cleanup-dot" style="background:${dot}"></span>
+        <span class="cleanup-title" title="${escHtml(g.title || "Unnamed")}">${escHtml(g.title || "Unnamed")}</span>
+        <span class="cleanup-tabcount">${g.tabCount ?? (g.tabs?.length ?? 0)} tabs · <strong class="dup-tab-count">${dups} duplicate${dups !== 1 ? "s" : ""}</strong></span>
+        <button class="cleanup-btn-dedup btn-secondary" type="button">Deduplicate</button>
+      </div>`;
+    el.querySelector(".cleanup-btn-dedup").addEventListener("click", async () => {
+      const res = await sendMsg({ action: "deduplicateGroupTabs", groupUid: g.uid });
+      if (res?.ok && res.removed > 0) {
+        await loadData();
+        renderCleanupDuplicateTabs();
+        showToast(`Removed ${res.removed} duplicate tab${res.removed !== 1 ? "s" : ""} — ${res.kept} kept`, "success");
+      } else {
+        showToast("No duplicates found", "info");
+      }
+    });
+    container.appendChild(el);
+  }
 }
 
 // ── Cleanup helpers ───────────────────────────────────────────────────────────

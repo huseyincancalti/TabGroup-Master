@@ -75,6 +75,58 @@ async function getStore() {
 const DELETED_KEYS = "deletedGroupKeys";
 const MAX_DELETED_KEYS = 800;
 
+// ── Tab-level deduplication helpers ──────────────────────────────────────────
+
+const _TRACKING_PARAMS = [
+  "utm_source","utm_medium","utm_campaign","utm_term","utm_content",
+  "fbclid","gclid","_ga","_gl","ref","source",
+];
+
+function normalizeTabUrl(url) {
+  if (!url) return "";
+  try {
+    const u = new URL(url);
+    _TRACKING_PARAMS.forEach(p => u.searchParams.delete(p));
+    u.hash = "";
+    u.hostname = u.hostname.toLowerCase().replace(/^www\./, "");
+    if (u.pathname.length > 1) u.pathname = u.pathname.replace(/\/$/, "");
+    return u.toString();
+  } catch (_) {
+    return url.trim().toLowerCase();
+  }
+}
+
+function normalizeTabTitle(title) {
+  if (!title) return "";
+  return title.trim()
+    .replace(/\s*[–\-]\s*\d+\s*$/, "")
+    .replace(/\s*#\d+\s*$/, "")
+    .replace(/\s*\(\d+\)\s*$/, "")
+    .toLowerCase();
+}
+
+function findTabDuplicateIndices(tabs) {
+  const seenUrls = new Map();
+  const seenTitleKeys = new Map();
+  const toRemove = [];
+  tabs.forEach((t, i) => {
+    if (!t.url) return;
+    const normUrl = normalizeTabUrl(t.url);
+    if (seenUrls.has(normUrl)) { toRemove.push(i); return; }
+    seenUrls.set(normUrl, i);
+    const normTitle = normalizeTabTitle(t.title || "");
+    if (normTitle.length > 4) {
+      try {
+        const host = new URL(t.url).hostname.replace(/^www\./, "").toLowerCase();
+        const key = `${host}::${normTitle}`;
+        if (seenTitleKeys.has(key)) { toRemove.push(i); return; }
+        seenTitleKeys.set(key, i);
+      } catch (_) {}
+    }
+  });
+  return toRemove.sort((a, b) => b - a); // descending so splice keeps indices valid
+}
+
 // Identity that survives re-import: normalized title + the set of tab hostnames.
 function groupSignature(g) {
   const title = normalizeTitle(g?.title || "");
@@ -959,17 +1011,28 @@ const handlers = {
       .map(t => (useLazy ? buildSuspendedUrl(t) : t.url));
     if (urls.length === 0) return { ok: false, error: "No restorable tabs" };
 
+    const OPEN_BATCH = 25; // tabs per burst — keeps Chrome's tab scheduler from spiking
+
     if (freeMode) {
       // ── FREE MODE: own window, no Chrome tab group ──────────────────────────
-      // Chrome never creates a "saved tab group", so nothing pollutes the
-      // bookmarks bar. The group lives entirely inside TabGroup Master.
-      const win = await chrome.windows.create({ url: urls, focused: true });
+      // Open first tab to create the window, then add the rest in small batches
+      // so Chrome doesn't try to load/layout 400 tabs simultaneously.
+      const [firstUrl, ...restUrls] = urls;
+      const win = await chrome.windows.create({ url: firstUrl, focused: true });
+      for (let i = 0; i < restUrls.length; i += OPEN_BATCH) {
+        const batch = restUrls.slice(i, i + OPEN_BATCH);
+        for (const url of batch) {
+          await chrome.tabs.create({ url, windowId: win.id, active: false });
+        }
+        if (i + OPEN_BATCH < restUrls.length) {
+          await new Promise(r => setTimeout(r, 80));
+        }
+      }
       group.active = true;
       group.openWindowId = win.id;
       group.chromeGroupId = null;
 
       // Seed the tracking map so tab changes (closes, navigations) are captured.
-      // windows.create resolves after all tabs are created, so the query is safe.
       const seedTabs = await chrome.tabs.query({ windowId: win.id });
       _activeWindows.set(win.id, {
         groupUid: group.uid,
@@ -989,9 +1052,12 @@ const handlers = {
     // ── LEGACY MODE: native Chrome tab group in the current window ─────────────
     const window = await chrome.windows.getCurrent();
     const tabIds = [];
-    for (const url of urls) {
-      const created = await chrome.tabs.create({ url, windowId: window.id, active: false });
+    for (let i = 0; i < urls.length; i++) {
+      const created = await chrome.tabs.create({ url: urls[i], windowId: window.id, active: false });
       tabIds.push(created.id);
+      if ((i + 1) % OPEN_BATCH === 0 && i + 1 < urls.length) {
+        await new Promise(r => setTimeout(r, 80));
+      }
     }
     const chromeGroupId = await chrome.tabs.group({ tabIds, createProperties: { windowId: window.id } });
     await chrome.tabGroups.update(chromeGroupId, { title: group.title, color: group.color });
@@ -1068,6 +1134,20 @@ const handlers = {
     await setStore({ savedGroups });
     broadcast({ type: "STORE_UPDATED" });
     return { ok: true };
+  },
+
+  async deduplicateGroupTabs({ groupUid }) {
+    const store = await getStore();
+    const group = buildIndexes(store).groupsByUid.get(groupUid);
+    if (!group) return { ok: false };
+    const tabs = group.tabs || [];
+    const removeIndices = findTabDuplicateIndices(tabs);
+    if (!removeIndices.length) return { ok: true, removed: 0, kept: tabs.length };
+    removeIndices.forEach(i => tabs.splice(i, 1));
+    group.tabCount = tabs.length;
+    await setStore({ savedGroups: store.savedGroups });
+    broadcast({ type: "STORE_UPDATED" });
+    return { ok: true, removed: removeIndices.length, kept: tabs.length };
   },
 
   async saveWindowAsGroup({ windowId, title }) {

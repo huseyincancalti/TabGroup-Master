@@ -1410,6 +1410,27 @@ body {
 .cleanup-btn-del svg { width: 14px; height: 14px; }
 .cleanup-btn-del:hover { color: var(--group-red); background: rgba(242,139,130,0.1); }
 
+.cleanup-btn-dedup {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  background: rgba(138,169,255,0.1);
+  color: var(--accent);
+  border: 1px solid rgba(138,169,255,0.25);
+  transition: background var(--transition), border-color var(--transition);
+}
+.cleanup-btn-dedup:hover { background: rgba(138,169,255,0.2); border-color: var(--accent); }
+.dup-tab-count { color: var(--accent); }
+
+.cleanup-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+}
+
 .btn-danger {
   padding: 7px 14px;
   background: rgba(242, 139, 130, 0.18);
