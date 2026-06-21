@@ -127,13 +127,19 @@ function findTabDuplicateIndices(tabs) {
   return toRemove.sort((a, b) => b - a); // descending so splice keeps indices valid
 }
 
-// Identity that survives re-import: normalized title + the set of tab hostnames.
+// Identity that survives re-import. MUST be stable whether or not the group's
+// tabs are loaded — groups are lazy, so a deleted group often has tabs:[] and
+// only a tabCount. Earlier this mixed in tab hostnames, so the tombstone written
+// at delete time ("title::") never matched the re-imported group ("title::hosts")
+// and deleted groups kept coming back. Fix: a titled group is identified by its
+// normalized title alone (always present); only unnamed groups fall back to hosts.
 function groupSignature(g) {
   const title = normalizeTitle(g?.title || "");
+  if (title) return "t:" + title;
   const hosts = [...new Set((g?.tabs || []).map((t) => {
     try { return new URL(t.url).hostname.replace(/^www\./, ""); } catch (_) { return ""; }
   }).filter(Boolean))].sort().join(",");
-  return title + "::" + hosts;
+  return hosts ? "h:" + hosts : "";
 }
 
 async function getDeletedKeys() {
@@ -145,7 +151,7 @@ async function addDeletedKeys(groups) {
   const set = await getDeletedKeys();
   for (const g of groups) {
     const sig = groupSignature(g);
-    if (sig && sig !== "::") set.add(sig);
+    if (sig) set.add(sig);
   }
   let arr = [...set];
   if (arr.length > MAX_DELETED_KEYS) arr = arr.slice(arr.length - MAX_DELETED_KEYS);
